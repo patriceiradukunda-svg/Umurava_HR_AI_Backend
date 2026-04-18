@@ -7,7 +7,6 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { connectDB } from './utils/db';
 import { errorHandler } from './middleware/errorHandler';
-
 // Routes
 import authRoutes from './routes/auth.routes';
 import jobRoutes from './routes/job.routes';
@@ -25,11 +24,19 @@ const PORT = process.env.PORT || 5000;
 // ── Middleware ──────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: [
-    process.env.FRONTEND_URL || 'http://localhost:3000',
-    'http://localhost:3000',
-    'http://localhost:3001',
-  ],
+  origin: (origin, callback) => {
+    const allowed = [
+      process.env.FRONTEND_URL || 'http://localhost:3000',
+      'http://localhost:3000',
+      'http://localhost:3001',
+    ];
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -62,13 +69,18 @@ app.use((_req, res) => {
 app.use(errorHandler);
 
 // ── Start ────────────────────────────────────────────────────
-connectDB().then(() => {
-  app.listen(PORT, () => {
-    console.log(`\n🚀 Umurava TalentAI Backend running on port ${PORT}`);
-    console.log(`🌐 CORS enabled for: ${process.env.FRONTEND_URL}`);
-    console.log(`🤖 Gemini API: configured`);
-    console.log(`📦 MongoDB: connected\n`);
+connectDB()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`\n🚀 Umurava TalentAI Backend running on port ${PORT}`);
+      console.log(`🌐 CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+      console.log(`🤖 Gemini API: configured`);
+      console.log(`📦 MongoDB: connected\n`);
+    });
+  })
+  .catch((err) => {
+    console.error('❌ Failed to connect to MongoDB:', err);
+    process.exit(1);
   });
-});
 
 export default app;
