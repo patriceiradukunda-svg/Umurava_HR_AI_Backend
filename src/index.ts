@@ -7,6 +7,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { connectDB } from './utils/db';
 import { errorHandler } from './middleware/errorHandler';
+
 // Routes
 import authRoutes from './routes/auth.routes';
 import jobRoutes from './routes/job.routes';
@@ -24,19 +25,11 @@ const PORT = process.env.PORT || 5000;
 // ── Middleware ──────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: (origin, callback) => {
-    const allowed = [
-      process.env.FRONTEND_URL || 'http://localhost:3000',
-      'http://localhost:3000',
-      'http://localhost:3001',
-    ];
-    // Allow requests with no origin (mobile apps, curl, Postman)
-    if (!origin || allowed.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS blocked for origin: ${origin}`));
-    }
-  },
+  origin: [
+    process.env.FRONTEND_URL || 'http://localhost:3000',
+    'http://localhost:3000',
+    'http://localhost:3001',
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -57,7 +50,11 @@ app.use('/api/settings',   settingsRoutes);
 
 // ── Health check ────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'Umurava TalentAI Backend', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    service: 'Umurava TalentAI Backend',
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ── 404 ─────────────────────────────────────────────────────
@@ -68,19 +65,21 @@ app.use((_req, res) => {
 // ── Error handler ────────────────────────────────────────────
 app.use(errorHandler);
 
-// ── Start ────────────────────────────────────────────────────
+// ── Start server FIRST so Render detects the open port ──────
+app.listen(PORT, () => {
+  console.log(`\n🚀 Umurava TalentAI Backend running on port ${PORT}`);
+  console.log(`🌐 CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+  console.log(`🤖 Gemini API: configured`);
+});
+
+// ── Connect to MongoDB after server is already up ────────────
 connectDB()
   .then(() => {
-    app.listen(PORT, () => {
-      console.log(`\n🚀 Umurava TalentAI Backend running on port ${PORT}`);
-      console.log(`🌐 CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
-      console.log(`🤖 Gemini API: configured`);
-      console.log(`📦 MongoDB: connected\n`);
-    });
+    console.log('📦 MongoDB: connected\n');
   })
   .catch((err) => {
-    console.error('❌ Failed to connect to MongoDB:', err);
-    process.exit(1);
+    console.error('❌ MongoDB connection failed:', err.message);
+    // Do NOT exit — keep server alive so Render stays up
   });
 
 export default app;
