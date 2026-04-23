@@ -13,21 +13,31 @@ const signToken = (id: string, email: string, role: string): string =>
     { expiresIn: '7d' }
   );
 
-// POST /api/auth/register
+// POST /api/auth/register — public, always creates applicant account
 router.post('/register', async (req: Request, res: Response) => {
   const { firstName, lastName, email, password, role, department, organization } = req.body;
+
   if (!firstName || !lastName || !email || !password) {
     res.status(400).json({ success: false, message: 'All fields are required' });
     return;
   }
+
+  // Security: prevent anyone from self-registering as recruiter or admin
+  const safeRole = role === 'recruiter' || role === 'admin' ? 'applicant' : (role || 'applicant');
+
   const existing = await User.findOne({ email });
   if (existing) {
     res.status(409).json({ success: false, message: 'Email already registered' });
     return;
   }
-  const user = await User.create({ firstName, lastName, email, password, role, department, organization });
 
-  // Create default settings for new user
+  const user = await User.create({
+    firstName, lastName, email, password,
+    role: safeRole,
+    department,
+    organization,
+  });
+
   await Settings.create({ userId: user._id });
 
   const token = signToken(user._id.toString(), user.email, user.role);
@@ -36,8 +46,55 @@ router.post('/register', async (req: Request, res: Response) => {
     message: 'Account created successfully',
     token,
     user: {
-      id: user._id, firstName: user.firstName, lastName: user.lastName,
-      email: user.email, role: user.role,
+      id: user._id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+      role: user.role,
+    },
+  });
+});
+
+// POST /api/auth/register-hr — protected, admin only, creates recruiter/admin accounts
+router.post('/register-hr', protect, async (req: AuthRequest, res: Response) => {
+  if (req.user?.role !== 'admin') {
+    res.status(403).json({ success: false, message: 'Only admins can create HR accounts' });
+    return;
+  }
+
+  const { firstName, lastName, email, password, role, department, organization } = req.body;
+
+  if (!firstName || !lastName || !email || !password) {
+    res.status(400).json({ success: false, message: 'All fields are required' });
+    return;
+  }
+
+  const existing = await User.findOne({ email });
+  if (existing) {
+    res.status(409).json({ success: false, message: 'Email already registered' });
+    return;
+  }
+
+  const user = await User.create({
+    firstName, lastName, email, password,
+    role: role === 'admin' ? 'admin' : 'recruiter',
+    department,
+    organization,
+  });
+
+  await Settings.create({ userId: user._id });
+
+  const token = signToken(user._id.toString(), user.email, user.role);
+  res.status(201).json({
+    success: true,
+    message: 'HR account created successfully',
+    token,
+    user: {
+      id: user._id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+      role: user.role,
     },
   });
 });
@@ -45,15 +102,18 @@ router.post('/register', async (req: Request, res: Response) => {
 // POST /api/auth/login
 router.post('/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
+
   if (!email || !password) {
     res.status(400).json({ success: false, message: 'Email and password required' });
     return;
   }
+
   const user = await User.findOne({ email, isActive: true }).select('+password');
   if (!user || !(await user.comparePassword(password))) {
     res.status(401).json({ success: false, message: 'Invalid credentials' });
     return;
   }
+
   user.lastLoginAt = new Date();
   await user.save({ validateBeforeSave: false });
 
@@ -62,8 +122,12 @@ router.post('/login', async (req: Request, res: Response) => {
     success: true,
     token,
     user: {
-      id: user._id, firstName: user.firstName, lastName: user.lastName,
-      email: user.email, role: user.role, department: user.department,
+      id: user._id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+      role: user.role,
+      department: user.department,
     },
   });
 });
