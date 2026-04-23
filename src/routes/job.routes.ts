@@ -10,10 +10,10 @@ router.use(protect);
 router.get('/', async (req: AuthRequest, res: Response) => {
   const { status, location, department, search } = req.query;
   const filter: Record<string, unknown> = {};
-  if (status && status !== 'all') filter.status = status;
-  if (location && location !== 'all') filter.location = { $regex: location, $options: 'i' };
-  if (department && department !== 'all') filter.department = { $regex: department, $options: 'i' };
-  if (search) filter.title = { $regex: search, $options: 'i' };
+  if (status && status !== 'all')         filter.status     = status;
+  if (location && location !== 'all')     filter.location   = { $regex: location,   $options: 'i' };
+  if (department && department !== 'all') filter.department = { $regex: department,  $options: 'i' };
+  if (search)                             filter.title      = { $regex: search,      $options: 'i' };
 
   const jobs = await Job.find(filter)
     .populate('createdBy', 'firstName lastName email')
@@ -22,7 +22,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   res.json({ success: true, count: jobs.length, data: jobs });
 });
 
-// GET /api/jobs/stats — counts per status (used by dashboard & sidebar badge)
+// GET /api/jobs/stats — counts per status
 router.get('/stats', async (_req: AuthRequest, res: Response) => {
   const [active, draft, screening, closed, total] = await Promise.all([
     Job.countDocuments({ status: 'active' }),
@@ -44,44 +44,68 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
 // POST /api/jobs — create job
 router.post('/', async (req: AuthRequest, res: Response) => {
   const {
-    title, department, location, type, description, requirements,
-    requiredSkills, niceToHaveSkills, minimumExperienceYears,
-    educationLevel, shortlistSize, status, screeningNotes,
+    title, department, location, type,
+    description, responsibilities,
+    requirements, requiredSkills, niceToHaveSkills,
+    minimumExperienceYears, educationLevel,
+    salaryMin, salaryMax, salaryCurrency,
+    applicationDeadline,
+    shortlistSize, status, screeningNotes,
   } = req.body;
 
   if (!title || !department || !location || !description) {
-    res.status(400).json({ success: false, message: 'title, department, location, description are required' });
+    res.status(400).json({ success: false, message: 'title, department, location and description are required' });
     return;
   }
 
   const job = await Job.create({
-    title, department, location, type, description,
-    requirements: requirements || [],
-    requiredSkills: requiredSkills || [],
-    niceToHaveSkills: niceToHaveSkills || [],
-    minimumExperienceYears: minimumExperienceYears || 0,
-    educationLevel: educationLevel || "Bachelor's",
-    shortlistSize: shortlistSize || 10,
-    status: status || 'draft',
-    screeningNotes,
-    createdBy: req.user!.id,
+    title,
+    department,
+    location,
+    type:                   type                   || 'Full-time',
+    description,
+    responsibilities:       responsibilities        || '',
+    requirements:           requirements            || [],
+    requiredSkills:         requiredSkills          || [],
+    niceToHaveSkills:       niceToHaveSkills        || [],
+    minimumExperienceYears: minimumExperienceYears  || 0,
+    educationLevel:         educationLevel          || "Bachelor's",
+    salaryMin:              salaryMin               ? Number(salaryMin)  : undefined,
+    salaryMax:              salaryMax               ? Number(salaryMax)  : undefined,
+    salaryCurrency:         salaryCurrency          || 'USD',
+    applicationDeadline:    applicationDeadline     ? new Date(applicationDeadline) : undefined,
+    shortlistSize:          shortlistSize           || 10,
+    status:                 status                  || 'draft',
+    screeningNotes:         screeningNotes          || '',
+    createdBy:              req.user!.id,
   });
 
   res.status(201).json({ success: true, message: 'Job created successfully', data: job });
 });
 
-// PUT /api/jobs/:id — update job
+// PUT /api/jobs/:id — update job (all fields via req.body spread — new fields flow automatically)
 router.put('/:id', async (req: AuthRequest, res: Response) => {
-  const job = await Job.findByIdAndUpdate(req.params.id, req.body, {
-    new: true, runValidators: true,
-  });
+  // Normalise numeric and date fields before saving
+  const update = { ...req.body };
+  if (update.salaryMin)           update.salaryMin           = Number(update.salaryMin);
+  if (update.salaryMax)           update.salaryMax           = Number(update.salaryMax);
+  if (update.applicationDeadline) update.applicationDeadline = new Date(update.applicationDeadline);
+  if (update.minimumExperienceYears) update.minimumExperienceYears = Number(update.minimumExperienceYears);
+  if (update.shortlistSize)       update.shortlistSize       = Number(update.shortlistSize);
+
+  const job = await Job.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
   if (!job) { res.status(404).json({ success: false, message: 'Job not found' }); return; }
   res.json({ success: true, message: 'Job updated', data: job });
 });
 
-// PATCH /api/jobs/:id/status — change job status only
+// PATCH /api/jobs/:id/status — status only
 router.patch('/:id/status', async (req: AuthRequest, res: Response) => {
   const { status } = req.body;
+  const valid = ['active', 'draft', 'screening', 'closed'];
+  if (!valid.includes(status)) {
+    res.status(400).json({ success: false, message: `Status must be one of: ${valid.join(', ')}` });
+    return;
+  }
   const job = await Job.findByIdAndUpdate(req.params.id, { status }, { new: true });
   if (!job) { res.status(404).json({ success: false, message: 'Job not found' }); return; }
   res.json({ success: true, message: `Job status changed to ${status}`, data: job });
@@ -93,10 +117,10 @@ router.delete('/:id', async (req: AuthRequest, res: Response) => {
   if (!job) { res.status(404).json({ success: false, message: 'Job not found' }); return; }
   await Applicant.deleteMany({ jobId: job._id });
   await job.deleteOne();
-  res.json({ success: true, message: 'Job and its applicants deleted' });
+  res.json({ success: true, message: 'Job and all its applicants deleted' });
 });
 
-// GET /api/jobs/:id/applicants — get applicants for a specific job
+// GET /api/jobs/:id/applicants — applicants for a specific job
 router.get('/:id/applicants', async (req: AuthRequest, res: Response) => {
   const { status, source } = req.query;
   const filter: Record<string, unknown> = { jobId: req.params.id };
