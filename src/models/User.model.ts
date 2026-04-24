@@ -19,7 +19,7 @@ const UserSchema = new Schema<IUser>({
   lastName:     { type: String, required: true, trim: true },
   email:        { type: String, required: true, unique: true, lowercase: true, trim: true },
   password:     { type: String, required: true, minlength: 6 },
-  role:         { type: String, enum: ['recruiter', 'admin'], default: 'recruiter' },
+  role: { type: String, enum: ['recruiter', 'admin', 'applicant'], default: 'applicant' },
   department:   { type: String },
   organization: { type: String, default: 'Umurava' },
   isActive:     { type: Boolean, default: true },
