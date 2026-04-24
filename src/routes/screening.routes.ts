@@ -3,10 +3,41 @@ import { protect, AuthRequest } from '../middleware/auth.middleware';
 import Job from '../models/Job.model';
 import Applicant from '../models/Applicant.model';
 import ScreeningResult from '../models/ScreeningResult.model';
-import { runAIScreening, ScreeningWeights, DEFAULT_WEIGHTS } from '../services/gemini.service';
+import { runAIScreening, testGeminiConnection, ScreeningWeights, DEFAULT_WEIGHTS } from '../services/gemini.service';
 
 const router = Router();
 router.use(protect);
+
+// ── GET /api/screening/test — run this first to diagnose connection ────────────
+router.get('/test', async (req: AuthRequest, res: Response) => {
+  try {
+    const hasKey     = !!process.env.GEMINI_API_KEY;
+    const keyPreview = hasKey
+      ? `${process.env.GEMINI_API_KEY!.substring(0, 6)}…${process.env.GEMINI_API_KEY!.slice(-4)}`
+      : 'NOT SET';
+
+    if (!hasKey) {
+      res.status(500).json({
+        success: false,
+        message: 'GEMINI_API_KEY is not set in environment variables.',
+        fix:     'Render → your backend service → Environment → add GEMINI_API_KEY',
+        keyPreview,
+      });
+      return;
+    }
+
+    const result = await testGeminiConnection();
+    res.json({
+      success:    result.ok,
+      message:    result.ok ? `Connected via ${result.model}` : result.error,
+      model:      result.model,
+      keyPreview,
+      fix: result.ok ? null : 'Check API key at console.cloud.google.com and ensure Gemini API is enabled',
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // GET /api/screening
 router.get('/', async (req: AuthRequest, res: Response) => {
@@ -51,11 +82,7 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
     const result = await ScreeningResult.findById(req.params.id)
       .populate('jobId',       'title department location requiredSkills')
       .populate('triggeredBy', 'firstName lastName');
-
-    if (!result) {
-      res.status(404).json({ success: false, message: 'Not found' });
-      return;
-    }
+    if (!result) { res.status(404).json({ success: false, message: 'Not found' }); return; }
     res.json({ success: true, data: result });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error', error: err });
@@ -71,23 +98,23 @@ router.post('/run', async (req: AuthRequest, res: Response) => {
       weights?: ScreeningWeights;
     } = req.body;
 
-    if (!jobId) {
-      res.status(400).json({ success: false, message: 'jobId is required' });
+    if (!jobId) { res.status(400).json({ success: false, message: 'jobId is required' }); return; }
+
+    // Check API key before starting
+    if (!process.env.GEMINI_API_KEY) {
+      res.status(500).json({
+        success: false,
+        message: 'GEMINI_API_KEY is not configured. Add it to Render → Environment variables.',
+      });
       return;
     }
 
     const job = await Job.findById(jobId);
-    if (!job) {
-      res.status(404).json({ success: false, message: 'Job not found' });
-      return;
-    }
+    if (!job)  { res.status(404).json({ success: false, message: 'Job not found' }); return; }
 
     const applicants = await Applicant.find({ jobId });
-    if (applicants.length === 0) {
-      res.status(400).json({
-        success: false,
-        message: 'No applicants found for this job. Add applicants first.',
-      });
+    if (!applicants.length) {
+      res.status(400).json({ success: false, message: 'No applicants found for this job.' });
       return;
     }
 
@@ -100,37 +127,29 @@ router.post('/run', async (req: AuthRequest, res: Response) => {
       availabilityBonus: weights?.availabilityBonus ?? DEFAULT_WEIGHTS.availabilityBonus,
     };
 
-    // Create running record — respond immediately (202)
     const screeningRecord = await ScreeningResult.create({
       jobId,
-      jobTitle:                  job.title,
-      triggeredBy:               req.user!.id,
-      triggeredAt:               new Date(),
-      totalApplicantsEvaluated:  applicants.length,
-      shortlistSize:             finalSize,
-      status:                    'running',
-      weights:                   finalWeights,
-      promptVersion:             'v2.0',
-      modelUsed:                 'gemini-1.5-pro',
+      jobTitle:                 job.title,
+      triggeredBy:              req.user!.id,
+      triggeredAt:              new Date(),
+      totalApplicantsEvaluated: applicants.length,
+      shortlistSize:            finalSize,
+      status:                   'running',
+      weights:                  finalWeights,
+      promptVersion:            'v3.0',
+      modelUsed:                'gemini-1.5-flash',
     });
 
     await Job.findByIdAndUpdate(jobId, { status: 'screening' });
 
-    // Run AI asynchronously — no blocking
     setImmediate(async () => {
       try {
-        const aiResult = await runAIScreening(job, applicants, finalWeights, finalSize, 'gemini-1.5-pro');
+        console.log(`\n🚀 Screening "${job.title}" — ${applicants.length} applicants`);
 
-        const shortlistWithMeta = aiResult.shortlist.map((c, idx) => ({
-          ...c,
-          rank:        idx + 1,
-          evaluatedAt: new Date(),
-        }));
+        const aiResult = await runAIScreening(job, applicants, finalWeights, finalSize, 'gemini-1.5-flash');
 
-        const allWithMeta = aiResult.allCandidates.map(c => ({
-          ...c,
-          evaluatedAt: new Date(),
-        }));
+        const shortlistWithMeta = aiResult.shortlist.map((c, idx) => ({ ...c, rank: idx + 1, evaluatedAt: new Date() }));
+        const allWithMeta       = aiResult.allCandidates.map(c => ({ ...c, evaluatedAt: new Date() }));
 
         await ScreeningResult.findByIdAndUpdate(screeningRecord._id, {
           status:                   'completed',
@@ -139,51 +158,39 @@ router.post('/run', async (req: AuthRequest, res: Response) => {
           allCandidates:            allWithMeta,
           insights:                 aiResult.insights,
           totalApplicantsEvaluated: aiResult.totalEvaluated,
+          modelUsed:                'gemini-1.5-flash',
         });
 
-        // Update applicant statuses
         const shortlistedIds = shortlistWithMeta.map(c => c.applicantId);
-        await Applicant.updateMany({ _id: { $in: shortlistedIds } }, { status: 'shortlisted' });
-        await Applicant.updateMany(
-          { jobId, _id: { $nin: shortlistedIds } },
-          { status: 'screened' }
-        );
+        await Applicant.updateMany({ _id: { $in: shortlistedIds } },              { status: 'shortlisted' });
+        await Applicant.updateMany({ jobId, _id: { $nin: shortlistedIds } },      { status: 'screened'    });
 
-        // Persist AI scores on shortlisted
-        for (const c of shortlistWithMeta) {
-          await Applicant.findByIdAndUpdate(c.applicantId, {
-            aiScore:       c.matchScore,
-            skillsMatchPct: c.scoreBreakdown.skillsMatch,
-          });
-        }
-        // Also store scores on non-shortlisted for reference
-        for (const c of allWithMeta.filter(c => !c.isShortlisted)) {
+        for (const c of shortlistWithMeta)
+          await Applicant.findByIdAndUpdate(c.applicantId, { aiScore: c.matchScore, skillsMatchPct: c.scoreBreakdown?.skillsMatch });
+        for (const c of allWithMeta.filter(c => !c.isShortlisted))
           await Applicant.findByIdAndUpdate(c.applicantId, { aiScore: c.matchScore });
-        }
 
         await Job.findByIdAndUpdate(jobId, { status: 'active' });
-        console.log(`✅ Screening complete: ${shortlistWithMeta.length} shortlisted from ${aiResult.totalEvaluated}`);
+        console.log(`✅ Done: ${shortlistWithMeta.length} shortlisted from ${aiResult.totalEvaluated}`);
 
-      } catch (err) {
-        console.error('❌ Screening failed:', (err as Error).message);
-        await ScreeningResult.findByIdAndUpdate(screeningRecord._id, {
-          status:       'failed',
-          errorMessage: (err as Error).message,
-        });
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        console.error('❌ Screening failed:', msg);
+        await ScreeningResult.findByIdAndUpdate(screeningRecord._id, { status: 'failed', errorMessage: msg });
         await Job.findByIdAndUpdate(jobId, { status: 'active' });
       }
     });
 
     res.status(202).json({
       success:          true,
-      message:          'Screening started. Poll for progress.',
+      message:          'Screening started.',
       screeningId:      screeningRecord._id,
       applicantsCount:  applicants.length,
-      estimatedSeconds: Math.ceil(applicants.length / 15) * 20,
+      estimatedSeconds: Math.ceil(applicants.length / 10) * 15,
     });
 
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error', error: err });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message || 'Server error' });
   }
 });
 
@@ -192,12 +199,7 @@ router.get('/:id/status', async (req: AuthRequest, res: Response) => {
   try {
     const result = await ScreeningResult.findById(req.params.id)
       .select('status completedAt totalApplicantsEvaluated shortlistSize shortlist errorMessage insights');
-
-    if (!result) {
-      res.status(404).json({ success: false, message: 'Not found' });
-      return;
-    }
-
+    if (!result) { res.status(404).json({ success: false, message: 'Not found' }); return; }
     res.json({
       success:        true,
       status:         result.status,
@@ -216,11 +218,8 @@ router.get('/:id/status', async (req: AuthRequest, res: Response) => {
 router.delete('/:id', async (req: AuthRequest, res: Response) => {
   try {
     const result = await ScreeningResult.findByIdAndDelete(req.params.id);
-    if (!result) {
-      res.status(404).json({ success: false, message: 'Not found' });
-      return;
-    }
-    res.json({ success: true, message: 'Screening result deleted' });
+    if (!result) { res.status(404).json({ success: false, message: 'Not found' }); return; }
+    res.json({ success: true, message: 'Deleted' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error', error: err });
   }
