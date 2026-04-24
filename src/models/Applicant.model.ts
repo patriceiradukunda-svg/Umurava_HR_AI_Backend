@@ -49,12 +49,12 @@ export interface IApplicant extends Document {
 }
 
 const ApplicantSchema = new Schema<IApplicant>({
-  jobId:         { type: Schema.Types.ObjectId, ref: 'Job', required: true },
-  source:        { type: String, enum: ['umurava_platform','csv_upload','pdf_upload','manual'], default: 'manual' },
-  status:        { type: String, enum: ['pending','screened','shortlisted','rejected'], default: 'pending' },
-  resumeUrl:     { type: String },
-  aiScore:       { type: Number },
-  skillsMatchPct:{ type: Number },
+  jobId:          { type: Schema.Types.ObjectId, ref: 'Job', required: true },
+  source:         { type: String, enum: ['umurava_platform', 'csv_upload', 'pdf_upload', 'manual'], default: 'manual' },
+  status:         { type: String, enum: ['pending', 'screened', 'shortlisted', 'rejected'], default: 'pending' },
+  resumeUrl:      { type: String },
+  aiScore:        { type: Number },
+  skillsMatchPct: { type: Number },
   talentProfile: {
     firstName: { type: String, required: true },
     lastName:  { type: String, required: true },
@@ -63,18 +63,57 @@ const ApplicantSchema = new Schema<IApplicant>({
     bio:       { type: String },
     location:  { type: String, required: true },
     skills: [{
-      name: String, level: String, yearsOfExperience: Number
+      name:              { type: String },
+      level:             { type: String },
+      yearsOfExperience: { type: Number },
     }],
-    languages: [{ name: String, proficiency: String }],
+    languages: [{
+      name:        { type: String },
+      proficiency: { type: String },
+    }],
     experience: [{
-      company: String, role: String, startDate: String, endDate: String,
-      description: String, technologies: [String], isCurrent: Boolean
+      company:      { type: String },
+      role:         { type: String },
+      startDate:    { type: String },
+      endDate:      { type: String },
+      description:  { type: String },
+      technologies: [{ type: String }],
+      isCurrent:    { type: Boolean },
     }],
     education: [{
-      institution: String, degree: String, fieldOfStudy: String,
-      startYear: Number, endYear: Number
+      institution:  { type: String },
+      degree:       { type: String },
+      fieldOfStudy: { type: String },
+      startYear:    { type: Number },
+      endYear:      { type: Number },
     }],
-    certifications: [{ name: String, issuer: String, issueDate: String }],
+    certifications: [{
+      name:      { type: String },
+      issuer:    { type: String },
+      issueDate: { type: String },
+    }],
     projects: [{
-      name: String, description: String, technologies: [String],
-      role: String, link: String, startDate: String, endDate: String
+      name:         { type: String },
+      description:  { type: String },
+      technologies: [{ type: String }],
+      role:         { type: String },
+      link:         { type: String },
+      startDate:    { type: String },
+      endDate:      { type: String },
+    }],
+    // ── KEY FIX: availability must NOT use bare `type` keyword ──────────
+    availability: {
+      status:    { type: String },
+      type:      { type: String },
+      startDate: { type: String },
+    },
+    socialLinks: {
+      linkedin:  { type: String },
+      github:    { type: String },
+      portfolio: { type: String },
+    },
+  },
+  appliedAt: { type: Date, default: Date.now },
+}, { timestamps: true });
+
+export default mongoose.model<IApplicant>('Applicant', ApplicantSchema);
