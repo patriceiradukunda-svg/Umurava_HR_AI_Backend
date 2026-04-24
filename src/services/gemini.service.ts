@@ -69,7 +69,7 @@ export const DEFAULT_WEIGHTS: ScreeningWeights = {
 
 // ─── Quick API key test — call this from a test route ─────────────────────────
 export async function testGeminiConnection(): Promise<{ ok: boolean; model: string; error?: string }> {
-  const modelsToTry = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro'];
+  const modelsToTry = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash-latest', 'gemini-1.5-pro-latest'];
   for (const modelName of modelsToTry) {
     try {
       const model  = genAI.getGenerativeModel({ model: modelName });
@@ -267,7 +267,7 @@ export async function runAIScreening(
   applicants: IApplicant[],
   weights: ScreeningWeights = DEFAULT_WEIGHTS,
   shortlistSize: number = 10,
-  modelName: string = 'gemini-1.5-flash'   // flash = faster, cheaper, more available
+  modelName: string = 'gemini-2.0-flash'    // primary model — fast, cheap, high quota
 ): Promise<{
   shortlist: CandidateResult[];
   allCandidates: CandidateResult[];
@@ -287,9 +287,10 @@ export async function runAIScreening(
   // Try flash first, fall back to pro if it fails
   const modelsToTry = [
     modelName,
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
-    'gemini-pro',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+    'gemini-1.5-flash-latest',
+    'gemini-1.5-pro-latest',
   ].filter((v, i, a) => a.indexOf(v) === i); // deduplicate
 
   let allCandidates: CandidateResult[] = [];
