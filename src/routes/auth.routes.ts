@@ -58,4 +58,3 @@ router.post('/login', async (req: Request, res: Response) => {
   await user.save({ validateBeforeSave: false });
 
   const token = signToken(user._id.toString(), user.email, user.role);
-===
