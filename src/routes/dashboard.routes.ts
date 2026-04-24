@@ -7,55 +7,80 @@ import ScreeningResult from '../models/ScreeningResult.model';
 const router = Router();
 router.use(protect);
 
-// GET /api/dashboard — everything the dashboard page needs in one call
-router.get('/', async (_req: AuthRequest, res: Response) => {
-  const now = new Date();
-  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+// GET /api/dashboard?from=&to=&days=
+router.get('/', async (req: AuthRequest, res: Response) => {
+  const { from, to, days } = req.query as Record<string, string>;
+
+  // Build date range
+  let rangeStart: Date | undefined;
+  let rangeEnd: Date | undefined = new Date();
+
+  if (from) {
+    rangeStart = new Date(from);
+    rangeEnd   = to ? new Date(new Date(to).setHours(23, 59, 59, 999)) : new Date();
+  } else if (days) {
+    const n = parseInt(days);
+    if (!isNaN(n) && n > 0) rangeStart = new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+  } else {
+    // default: last 7 days for trend counts; all-time for totals
+    rangeStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  }
+
+  const dateMatch = rangeStart
+    ? { appliedAt: { $gte: rangeStart, $lte: rangeEnd } }
+    : {};
+
+  const jobDateMatch = rangeStart
+    ? { createdAt: { $gte: rangeStart, $lte: rangeEnd } }
+    : {};
 
   const [
     activeJobs,
-    newJobsThisWeek,
+    newJobsInRange,
     totalApplicants,
-    newApplicantsThisWeek,
+    newApplicantsInRange,
     shortlisted,
     screeningRuns,
     recentJobs,
     recentScreenings,
   ] = await Promise.all([
     Job.countDocuments({ status: 'active' }),
-    Job.countDocuments({ status: 'active', createdAt: { $gte: weekAgo } }),
+    Job.countDocuments({ status: 'active', ...jobDateMatch }),
     Applicant.countDocuments(),
-    Applicant.countDocuments({ appliedAt: { $gte: weekAgo } }),
+    Applicant.countDocuments(dateMatch),
     Applicant.countDocuments({ status: 'shortlisted' }),
     ScreeningResult.countDocuments({ status: 'completed' }),
     Job.find()
       .sort({ createdAt: -1 })
-      .limit(5)
-      .select('title location status applicantCount createdAt department'),
+      .limit(6)
+      .select('title location status applicantCount createdAt department type'),
     ScreeningResult.find({ status: 'completed' })
       .sort({ completedAt: -1 })
       .limit(5)
       .select('jobTitle totalApplicantsEvaluated shortlist completedAt'),
   ]);
 
-  // AI activity chart: screenings per day for last 7 days
+  // Screenings per day for the selected range (max 30 points)
+  const trendDays = rangeStart
+    ? Math.min(Math.ceil((rangeEnd!.getTime() - rangeStart.getTime()) / 86400000), 30)
+    : 7;
+
   const aiActivity = await Promise.all(
-    Array.from({ length: 7 }, async (_, i) => {
-      const day = new Date(now);
-      day.setDate(day.getDate() - (6 - i));
-      const dayStart = new Date(day.setHours(0, 0, 0, 0));
-      const dayEnd   = new Date(day.setHours(23, 59, 59, 999));
+    Array.from({ length: trendDays }, async (_, i) => {
+      const d = new Date(rangeStart || Date.now());
+      d.setDate(d.getDate() + i);
+      const dayStart = new Date(d); dayStart.setHours(0, 0, 0, 0);
+      const dayEnd   = new Date(d); dayEnd.setHours(23, 59, 59, 999);
       const count = await ScreeningResult.countDocuments({
         triggeredAt: { $gte: dayStart, $lte: dayEnd },
       });
       return {
-        label: dayStart.toLocaleDateString('en-US', { weekday: 'short' }),
+        label: dayStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
         count,
       };
     })
   );
 
-  // Shortlist rate
   const shortlistRate = totalApplicants > 0
     ? parseFloat(((shortlisted / totalApplicants) * 100).toFixed(1))
     : 0;
@@ -65,9 +90,9 @@ router.get('/', async (_req: AuthRequest, res: Response) => {
     data: {
       stats: {
         activeJobs,
-        newJobsThisWeek,
+        newJobsThisWeek: newJobsInRange,
         totalApplicants,
-        newApplicantsThisWeek,
+        newApplicantsThisWeek: newApplicantsInRange,
         shortlisted,
         shortlistRate,
         screeningRuns,

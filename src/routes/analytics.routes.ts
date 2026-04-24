@@ -3,39 +3,65 @@ import { protect, AuthRequest } from '../middleware/auth.middleware';
 import Applicant from '../models/Applicant.model';
 import ScreeningResult from '../models/ScreeningResult.model';
 import Job from '../models/Job.model';
+import mongoose from 'mongoose';
 
 const router = Router();
 router.use(protect);
 
-// GET /api/analytics — full analytics page data
-router.get('/', async (_req: AuthRequest, res: Response) => {
+// ─── Helper: build date filter from query params ──────────────────────────────
+function dateFilter(from?: string, to?: string, days?: string) {
+  const filter: Record<string, Date> = {};
+  if (from) filter.$gte = new Date(from);
+  if (to)   filter.$lte = new Date(new Date(to).setHours(23, 59, 59, 999));
+  if (!from && !to && days) {
+    const n = parseInt(days);
+    if (!isNaN(n) && n > 0) filter.$gte = new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+  }
+  return Object.keys(filter).length > 0 ? filter : undefined;
+}
+
+// GET /api/analytics — filterable analytics data
+router.get('/', async (req: AuthRequest, res: Response) => {
+  const { jobId, department, from, to, days } = req.query as Record<string, string>;
+
+  // ── Build applicant filter ──────────────────────────────────────────────────
+  const appFilter: Record<string, any> = {};
+  const df = dateFilter(from, to, days);
+  if (df) appFilter.appliedAt = df;
+
+  if (jobId && jobId !== 'all') {
+    appFilter.jobId = new mongoose.Types.ObjectId(jobId);
+  } else if (department && department !== 'all') {
+    // Get all jobs in that dept, then filter by their IDs
+    const deptJobs = await Job.find({ department }).select('_id');
+    appFilter.jobId = { $in: deptJobs.map(j => j._id) };
+  }
+
+  // ── Screening filter (to match the date range) ──────────────────────────────
+  const screenFilter: Record<string, any> = { status: 'completed' };
+  if (df) screenFilter.completedAt = df;
+  if (jobId && jobId !== 'all') screenFilter.jobId = new mongoose.Types.ObjectId(jobId);
+  else if (department && department !== 'all') {
+    const deptJobs = await Job.find({ department }).select('_id');
+    screenFilter.jobId = { $in: deptJobs.map(j => j._id) };
+  }
 
   const [
     totalApplicants,
     shortlisted,
     allScreenings,
-    jobsWithApplicants,
   ] = await Promise.all([
-    Applicant.countDocuments(),
-    Applicant.countDocuments({ status: 'shortlisted' }),
-    ScreeningResult.find({ status: 'completed' }).select('shortlist totalApplicantsEvaluated completedAt triggeredAt'),
-    Job.find({ applicantCount: { $gt: 0 } }).select('title applicantCount'),
+    Applicant.countDocuments(appFilter),
+    Applicant.countDocuments({ ...appFilter, status: 'shortlisted' }),
+    ScreeningResult.find(screenFilter).select('shortlist totalApplicantsEvaluated completedAt triggeredAt jobId insights'),
   ]);
 
-  // Average time to shortlist (minutes)
-  const timings = allScreenings
-    .filter(s => s.completedAt && s.triggeredAt)
-    .map(s => (new Date(s.completedAt!).getTime() - new Date(s.triggeredAt).getTime()) / 60000);
-  const avgTimeToShortlist = timings.length > 0
-    ? parseFloat((timings.reduce((a, b) => a + b, 0) / timings.length).toFixed(1))
-    : 0;
-
-  // All AI scores from completed screenings
+  // ── All AI scores ───────────────────────────────────────────────────────────
   const allScores: number[] = allScreenings.flatMap(s =>
-    s.shortlist.map((c: { matchScore: number }) => c.matchScore)
+    (s.shortlist || []).map((c: any) => c.matchScore)
   );
 
-  // Score distribution buckets: 0-40, 41-55, 56-70, 71-80, 81-90, 91-100
+  // ── Score distribution ──────────────────────────────────────────────────────
   const buckets = [
     { label: '0–40',   min: 0,  max: 40,  count: 0 },
     { label: '41–55',  min: 41, max: 55,  count: 0 },
@@ -45,21 +71,21 @@ router.get('/', async (_req: AuthRequest, res: Response) => {
     { label: '91–100', min: 91, max: 100, count: 0 },
   ];
   allScores.forEach(score => {
-    const bucket = buckets.find(b => score >= b.min && score <= b.max);
-    if (bucket) bucket.count++;
+    const b = buckets.find(b => score >= b.min && score <= b.max);
+    if (b) b.count++;
   });
 
-  // Top shortlisted candidates
+  // ── Top candidates ──────────────────────────────────────────────────────────
   const topCandidates = allScreenings
-    .flatMap(s => s.shortlist.slice(0, 3))
-    .sort((a: { matchScore: number }, b: { matchScore: number }) => b.matchScore - a.matchScore)
+    .flatMap(s => (s.shortlist || []).slice(0, 3))
+    .sort((a: any, b: any) => b.matchScore - a.matchScore)
     .slice(0, 5);
 
-  // Top skill gaps across all shortlists (skills present vs required)
+  // ── Skill gaps (from shortlist skillScores) ─────────────────────────────────
   const skillGapMap: Record<string, { present: number; total: number }> = {};
   allScreenings.forEach(s => {
-    s.shortlist.forEach((c: { skillScores?: { name: string; score: number }[] }) => {
-      (c.skillScores || []).forEach((sk: { name: string; score: number }) => {
+    (s.shortlist || []).forEach((c: any) => {
+      (c.skillScores || []).forEach((sk: any) => {
         if (!skillGapMap[sk.name]) skillGapMap[sk.name] = { present: 0, total: 0 };
         skillGapMap[sk.name].total++;
         if (sk.score >= 60) skillGapMap[sk.name].present++;
@@ -71,13 +97,56 @@ router.get('/', async (_req: AuthRequest, res: Response) => {
       name,
       coverageRate: total > 0 ? Math.round((present / total) * 100) : 0,
     }))
-    .sort((a, b) => b.coverageRate - a.coverageRate)
+    .sort((a, b) => a.coverageRate - b.coverageRate) // worst first
     .slice(0, 8);
 
-  // Pipeline summary per status
+  // ── AI skill-gap recommendations from screening insights ────────────────────
+  // Pull from stored insights across all matched screenings
+  const skillGapInsights: {
+    skill: string; coverage: number; severity: string; recommendation: string; jobTitle?: string;
+  }[] = [];
+
+  const marketRecs: string[] = [];
+  const hiringRecs: string[] = [];
+
+  allScreenings.forEach(s => {
+    const ins = (s as any).insights;
+    if (!ins) return;
+    (ins.overallSkillGaps || []).forEach((g: any) => {
+      skillGapInsights.push({ ...g, jobId: s.jobId });
+    });
+    (ins.marketRecommendations || []).forEach((r: string) => {
+      if (!marketRecs.includes(r)) marketRecs.push(r);
+    });
+    if (ins.hiringRecommendation && !hiringRecs.includes(ins.hiringRecommendation)) {
+      hiringRecs.push(ins.hiringRecommendation);
+    }
+  });
+
+  // ── Pipeline summary ────────────────────────────────────────────────────────
   const pipelineSummary = await Applicant.aggregate([
+    { $match: appFilter },
     { $group: { _id: '$status', count: { $sum: 1 } } },
   ]);
+
+  // ── Trend: applicants per day for last 7 or 30 days ────────────────────────
+  const trendDays = parseInt(days || '7') || 7;
+  const trendBuckets = Math.min(trendDays, 30);
+  const trendData = await Promise.all(
+    Array.from({ length: trendBuckets }, async (_, i) => {
+      const d = new Date();
+      d.setDate(d.getDate() - (trendBuckets - 1 - i));
+      const start = new Date(d); start.setHours(0, 0, 0, 0);
+      const end   = new Date(d); end.setHours(23, 59, 59, 999);
+      const matchFilter: any = { appliedAt: { $gte: start, $lte: end } };
+      if (appFilter.jobId) matchFilter.jobId = appFilter.jobId;
+      const count = await Applicant.countDocuments(matchFilter);
+      return {
+        label: start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+        count,
+      };
+    })
+  );
 
   const avgScore = allScores.length > 0
     ? Math.round(allScores.reduce((a, b) => a + b, 0) / allScores.length)
@@ -88,9 +157,6 @@ router.get('/', async (_req: AuthRequest, res: Response) => {
     success: true,
     data: {
       summary: {
-        avgTimeToShortlist,
-        aiAccuracy: 94, // static — would need recruiter feedback loop in production
-        biasReduction: 78,
         avgScore,
         topScore,
         totalApplicants,
@@ -101,23 +167,26 @@ router.get('/', async (_req: AuthRequest, res: Response) => {
       },
       scoreDistribution: buckets,
       topSkillGaps,
+      skillGapInsights,
+      marketRecommendations: marketRecs.slice(0, 5),
+      hiringRecommendations: hiringRecs.slice(0, 3),
       pipelineSummary,
       topCandidates,
-      jobsWithApplicants,
+      trendData,
     },
   });
 });
 
-// GET /api/analytics/pipeline/:jobId — kanban pipeline data for one job
+// GET /api/analytics/pipeline/:jobId
 router.get('/pipeline/:jobId', async (req: AuthRequest, res: Response) => {
   const { jobId } = req.params;
 
   const [applied, screened, shortlisted, rejected] = await Promise.all([
     Applicant.find({ jobId, status: 'pending' })
-      .select('talentProfile.firstName talentProfile.lastName talentProfile.location source appliedAt')
+      .select('talentProfile.firstName talentProfile.lastName talentProfile.location appliedAt')
       .limit(10),
     Applicant.find({ jobId, status: 'screened' })
-      .select('talentProfile.firstName talentProfile.lastName aiScore source')
+      .select('talentProfile.firstName talentProfile.lastName aiScore')
       .limit(10),
     Applicant.find({ jobId, status: 'shortlisted' })
       .select('talentProfile.firstName talentProfile.lastName aiScore skillsMatchPct')
@@ -129,18 +198,32 @@ router.get('/pipeline/:jobId', async (req: AuthRequest, res: Response) => {
   ]);
 
   const counts = await Applicant.aggregate([
-    { $match: { jobId: require('mongoose').Types.ObjectId.createFromHexString(jobId) } },
+    { $match: { jobId: new mongoose.Types.ObjectId(jobId) } },
     { $group: { _id: '$status', count: { $sum: 1 } } },
   ]);
 
   res.json({
     success: true,
     data: {
-      applied:    { candidates: applied,    count: counts.find(c => c._id === 'pending')?.count    || 0 },
-      screened:   { candidates: screened,   count: counts.find(c => c._id === 'screened')?.count   || 0 },
-      shortlisted:{ candidates: shortlisted,count: counts.find(c => c._id === 'shortlisted')?.count|| 0 },
-      rejected:   { candidates: rejected,   count: counts.find(c => c._id === 'rejected')?.count   || 0 },
+      applied:     { candidates: applied,     count: counts.find(c => c._id === 'pending')?.count     || 0 },
+      screened:    { candidates: screened,    count: counts.find(c => c._id === 'screened')?.count    || 0 },
+      shortlisted: { candidates: shortlisted, count: counts.find(c => c._id === 'shortlisted')?.count || 0 },
+      rejected:    { candidates: rejected,    count: counts.find(c => c._id === 'rejected')?.count    || 0 },
     },
+  });
+});
+
+// GET /api/analytics/filter-options — jobs + departments for filter dropdowns
+router.get('/filter-options', async (_req: AuthRequest, res: Response) => {
+  const jobs = await Job.find({ applicantCount: { $gt: 0 } })
+    .select('title department status')
+    .sort({ createdAt: -1 });
+
+  const departments = [...new Set(jobs.map(j => j.department).filter(Boolean))];
+
+  res.json({
+    success: true,
+    data: { jobs, departments },
   });
 });
 
