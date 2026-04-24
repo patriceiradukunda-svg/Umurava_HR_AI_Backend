@@ -13,7 +13,7 @@ const signToken = (id: string, email: string, role: string): string =>
     { expiresIn: '7d' }
   );
 
-// POST /api/auth/register
+// POST /api/auth/register — public, always creates applicant account
 router.post('/register', async (req: Request, res: Response) => {
   try {
     const { firstName, lastName, email, password, role, department, organization } = req.body;
@@ -23,16 +23,36 @@ router.post('/register', async (req: Request, res: Response) => {
       return;
     }
 
-    const existing = await User.findOne({ email });
-    if (existing) {
-      res.status(409).json({ success: false, message: 'Email already registered' });
+    if (password.length < 6) {
+      res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
       return;
     }
 
-    const user = await User.create({ firstName, lastName, email, password, role, department, organization });
+    // Security: anyone trying to register as recruiter or admin gets applicant role
+    const safeRole = (role === 'recruiter' || role === 'admin') ? 'applicant' : (role || 'applicant');
 
-    // Create default settings for new user
-    await Settings.create({ userId: user._id });
+    const existing = await User.findOne({ email: email.toLowerCase().trim() });
+    if (existing) {
+      res.status(409).json({ success: false, message: 'This email is already registered' });
+      return;
+    }
+
+    const user = await User.create({
+      firstName: firstName.trim(),
+      lastName:  lastName.trim(),
+      email:     email.toLowerCase().trim(),
+      password,
+      role:      safeRole,
+      department:   department   || undefined,
+      organization: organization || 'Umurava',
+    });
+
+    // Create settings — ignore if already exists
+    try {
+      await Settings.create({ userId: user._id });
+    } catch {
+      // Settings already exist — not a problem
+    }
 
     const token = signToken(user._id.toString(), user.email, user.role);
 
@@ -41,15 +61,83 @@ router.post('/register', async (req: Request, res: Response) => {
       message: 'Account created successfully',
       token,
       user: {
-        id: user._id,
+        id:        user._id,
         firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        role: user.role,
+        lastName:  user.lastName,
+        email:     user.email,
+        role:      user.role,
       },
     });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error', error: err });
+
+  } catch (err: any) {
+    console.error('❌ Register error:', err.message, err);
+    if (err.code === 11000) {
+      res.status(409).json({ success: false, message: 'This email is already registered' });
+      return;
+    }
+    res.status(500).json({ success: false, message: err.message || 'Registration failed' });
+  }
+});
+
+// POST /api/auth/register-hr — protected, admin only
+router.post('/register-hr', protect, async (req: AuthRequest, res: Response) => {
+  try {
+    if (req.user?.role !== 'admin') {
+      res.status(403).json({ success: false, message: 'Only admins can create HR accounts' });
+      return;
+    }
+
+    const { firstName, lastName, email, password, role, department, organization } = req.body;
+
+    if (!firstName || !lastName || !email || !password) {
+      res.status(400).json({ success: false, message: 'All fields are required' });
+      return;
+    }
+
+    const existing = await User.findOne({ email: email.toLowerCase().trim() });
+    if (existing) {
+      res.status(409).json({ success: false, message: 'This email is already registered' });
+      return;
+    }
+
+    const user = await User.create({
+      firstName: firstName.trim(),
+      lastName:  lastName.trim(),
+      email:     email.toLowerCase().trim(),
+      password,
+      role:      role === 'admin' ? 'admin' : 'recruiter',
+      department:   department   || undefined,
+      organization: organization || 'Umurava',
+    });
+
+    try {
+      await Settings.create({ userId: user._id });
+    } catch {
+      // Settings already exist — not a problem
+    }
+
+    const token = signToken(user._id.toString(), user.email, user.role);
+
+    res.status(201).json({
+      success: true,
+      message: 'HR account created successfully',
+      token,
+      user: {
+        id:        user._id,
+        firstName: user.firstName,
+        lastName:  user.lastName,
+        email:     user.email,
+        role:      user.role,
+      },
+    });
+
+  } catch (err: any) {
+    console.error('❌ Register HR error:', err.message, err);
+    if (err.code === 11000) {
+      res.status(409).json({ success: false, message: 'This email is already registered' });
+      return;
+    }
+    res.status(500).json({ success: false, message: err.message || 'Registration failed' });
   }
 });
 
@@ -63,9 +151,13 @@ router.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
-    const user = await User.findOne({ email, isActive: true }).select('+password');
+    const user = await User.findOne({
+      email: email.toLowerCase().trim(),
+      isActive: true,
+    }).select('+password');
+
     if (!user || !(await user.comparePassword(password))) {
-      res.status(401).json({ success: false, message: 'Invalid credentials' });
+      res.status(401).json({ success: false, message: 'Invalid email or password' });
       return;
     }
 
@@ -79,15 +171,18 @@ router.post('/login', async (req: Request, res: Response) => {
       message: 'Login successful',
       token,
       user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        role: user.role,
+        id:         user._id,
+        firstName:  user.firstName,
+        lastName:   user.lastName,
+        email:      user.email,
+        role:       user.role,
+        department: user.department,
       },
     });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error', error: err });
+
+  } catch (err: any) {
+    console.error('❌ Login error:', err.message, err);
+    res.status(500).json({ success: false, message: 'Login failed. Please try again.' });
   }
 });
 
@@ -100,8 +195,9 @@ router.get('/me', protect, async (req: AuthRequest, res: Response) => {
       return;
     }
     res.status(200).json({ success: true, user });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error', error: err });
+  } catch (err: any) {
+    console.error('❌ Me error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to get user' });
   }
 });
 
@@ -115,6 +211,11 @@ router.patch('/change-password', protect, async (req: AuthRequest, res: Response
       return;
     }
 
+    if (newPassword.length < 6) {
+      res.status(400).json({ success: false, message: 'New password must be at least 6 characters' });
+      return;
+    }
+
     const user = await User.findById(req.user?.id).select('+password');
     if (!user || !(await user.comparePassword(currentPassword))) {
       res.status(401).json({ success: false, message: 'Current password is incorrect' });
@@ -125,8 +226,10 @@ router.patch('/change-password', protect, async (req: AuthRequest, res: Response
     await user.save();
 
     res.status(200).json({ success: true, message: 'Password updated successfully' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error', error: err });
+
+  } catch (err: any) {
+    console.error('❌ Change password error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to update password' });
   }
 });
 
