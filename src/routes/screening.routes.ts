@@ -137,7 +137,7 @@ router.post('/run', async (req: AuthRequest, res: Response) => {
       status:                   'running',
       weights:                  finalWeights,
       promptVersion:            'v3.0',
-      modelUsed:                'gemini-1.5-flash',
+      modelUsed:                'gemini-2.0-flash',
     });
 
     await Job.findByIdAndUpdate(jobId, { status: 'screening' });
@@ -146,7 +146,7 @@ router.post('/run', async (req: AuthRequest, res: Response) => {
       try {
         console.log(`\n🚀 Screening "${job.title}" — ${applicants.length} applicants`);
 
-        const aiResult = await runAIScreening(job, applicants, finalWeights, finalSize, 'gemini-1.5-flash');
+        const aiResult = await runAIScreening(job, applicants, finalWeights, finalSize, 'gemini-2.0-flash');
 
         const shortlistWithMeta = aiResult.shortlist.map((c, idx) => ({ ...c, rank: idx + 1, evaluatedAt: new Date() }));
         const allWithMeta       = aiResult.allCandidates.map(c => ({ ...c, evaluatedAt: new Date() }));
@@ -158,7 +158,7 @@ router.post('/run', async (req: AuthRequest, res: Response) => {
           allCandidates:            allWithMeta,
           insights:                 aiResult.insights,
           totalApplicantsEvaluated: aiResult.totalEvaluated,
-          modelUsed:                'gemini-1.5-flash',
+          modelUsed:                'gemini-2.0-flash',
         });
 
         const shortlistedIds = shortlistWithMeta.map(c => c.applicantId);
