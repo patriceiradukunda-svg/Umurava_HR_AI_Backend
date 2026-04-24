@@ -78,11 +78,3 @@ const ApplicantSchema = new Schema<IApplicant>({
     projects: [{
       name: String, description: String, technologies: [String],
       role: String, link: String, startDate: String, endDate: String
-    }],
-    availability: { status: String, type: String, startDate: String },
-    socialLinks: { linkedin: String, github: String, portfolio: String },
-  },
-  appliedAt: { type: Date, default: Date.now },
-}, { timestamps: true });
-
-export default mongoose.model<IApplicant>('Applicant', ApplicantSchema);
