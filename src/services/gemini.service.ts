@@ -9,8 +9,9 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1/models';
 const MODEL_LIST  = [
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
-  'gemini-1.5-flash',
-  'gemini-1.5-pro',
+  'gemini-1.5-flash-8b',       // highest free-tier quota limit
+  'gemini-1.5-flash-8b-latest',
+  'gemini-2.0-flash-exp',
 ];
 
 export interface SkillGap {
@@ -109,21 +110,36 @@ async function callWithFallback(prompt: string, label: string): Promise<any> {
         lastError = err?.message || String(err);
         console.error(`  ❌ ${modelName} attempt ${attempt}: ${lastError.substring(0, 150)}`);
 
-        // Auth/billing errors — stop immediately, no point trying other models
+        // Auth/billing errors — stop immediately
         if (lastError.includes('API_KEY_INVALID') ||
             lastError.includes('HTTP 400') ||
             lastError.includes('HTTP 401') ||
             lastError.includes('HTTP 403')) {
           throw new Error(
-            `Gemini API key is invalid or billing not enabled. ` +
-            `Error: ${lastError}. ` +
+            `Gemini API key error. Error: ${lastError}. ` +
             `Get a new key at aistudio.google.com/app/apikey`
           );
         }
 
+        // 429 = rate limited — wait 65 seconds then retry once
+        if (lastError.includes('HTTP 429') || lastError.includes('quota')) {
+          if (attempt < 2) {
+            console.log(`  ⏳ Rate limited (429) — waiting 65s for quota reset…`);
+            await new Promise(r => setTimeout(r, 65000));
+          } else {
+            console.log(`  ⏱️  429 on attempt 2 — skipping to next model`);
+          }
+          continue;
+        }
+
+        // 404 = model not found on this API version — skip immediately
+        if (lastError.includes('HTTP 404') || lastError.includes('not found')) {
+          break; // next model
+        }
+
         if (attempt < 2) {
-          console.log(`  ⏳ Waiting 3s before retry…`);
-          await new Promise(r => setTimeout(r, 3000));
+          console.log(`  ⏳ Waiting 5s before retry…`);
+          await new Promise(r => setTimeout(r, 5000));
         }
       }
     }
