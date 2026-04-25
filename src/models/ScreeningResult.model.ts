@@ -1,4 +1,5 @@
 import mongoose, { Schema, Document } from 'mongoose';
+
 export interface IScreeningResult extends Document {
   jobId: mongoose.Types.ObjectId;
   jobTitle: string;
@@ -26,12 +27,13 @@ export interface IScreeningResult extends Document {
   modelUsed: string;
   errorMessage?: string;
 }
+
 interface CandidateEntry {
   rank?: number;
   applicantId: mongoose.Types.ObjectId;
   firstName: string; lastName: string; email: string;
   headline: string; location: string;
-  availability: { status: string; type: string };
+  availability: { status: string; employmentType: string };
   matchScore: number;
   scoreBreakdown: {
     skillsMatch: number; experienceMatch: number;
@@ -48,43 +50,57 @@ interface CandidateEntry {
   skillScores?: { name: string; score: number }[];
   evaluatedAt?: Date;
 }
+
+// ⚠️  Do NOT use plain { status: String, type: String } for availability —
+// 'type' is a reserved Mongoose keyword and causes CastError.
+// Always use explicit { type: SchemaType } syntax for every field.
 const CandidateSchema = {
   rank:        Number,
   applicantId: { type: Schema.Types.ObjectId, ref: 'Applicant' },
-  firstName: String, lastName: String, email: String,
-  headline: String, location: String,
-  availability: { status: String, type: String },
+  firstName:   String,
+  lastName:    String,
+  email:       String,
+  headline:    String,
+  location:    String,
+  availability: {
+    status:         { type: String, default: 'Open to Opportunities' },
+    employmentType: { type: String, default: 'Full-time' },
+  },
   matchScore: Number,
   scoreBreakdown: {
-    skillsMatch: Number, experienceMatch: Number,
-    educationMatch: Number, projectRelevance: Number, availabilityBonus: Number,
+    skillsMatch:       Number,
+    experienceMatch:   Number,
+    educationMatch:    Number,
+    projectRelevance:  Number,
+    availabilityBonus: Number,
   },
-  strengths: [String],
-  gaps: [String],
-  recommendation: String,
-  shortlistedReason: String,
-  isShortlisted: Boolean,
-  skillGaps: [String],
-  growthAreas: [String],
+  strengths:             [String],
+  gaps:                  [String],
+  recommendation:        String,
+  shortlistedReason:     String,
+  isShortlisted:         Boolean,
+  skillGaps:             [String],
+  growthAreas:           [String],
   courseRecommendations: [String],
-  skillScores: [{ name: String, score: Number }],
-  evaluatedAt: { type: Date, default: Date.now },
+  skillScores:           [{ name: String, score: Number }],
+  evaluatedAt:           { type: Date, default: Date.now },
 };
+
 const ScreeningResultSchema = new Schema<IScreeningResult>({
-  jobId:       { type: Schema.Types.ObjectId, ref: 'Job', required: true },
+  jobId:       { type: Schema.Types.ObjectId, ref: 'Job',  required: true },
   jobTitle:    { type: String, required: true },
   triggeredBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   triggeredAt: { type: Date, default: Date.now },
-  completedAt: { type: Date },
+  completedAt: Date,
   totalApplicantsEvaluated: { type: Number, default: 0 },
   shortlistSize:            { type: Number, default: 10 },
-  status: { type: String, enum: ['running','completed','failed'], default: 'running' },
+  status: { type: String, enum: ['running', 'completed', 'failed'], default: 'running' },
   weights: {
     skillsMatch:       { type: Number, default: 40 },
     experienceMatch:   { type: Number, default: 30 },
     educationMatch:    { type: Number, default: 15 },
     projectRelevance:  { type: Number, default: 10 },
-    availabilityBonus: { type: Number, default: 5 },
+    availabilityBonus: { type: Number, default: 5  },
   },
   shortlist:     [CandidateSchema],
   allCandidates: [CandidateSchema],
@@ -92,14 +108,15 @@ const ScreeningResultSchema = new Schema<IScreeningResult>({
     overallSkillGaps: [{
       skill: String, coverage: Number, severity: String, recommendation: String,
     }],
-    marketRecommendations: [String],
-    pipelineHealth: String,
+    marketRecommendations:  [String],
+    pipelineHealth:         String,
     topStrengthsAcrossPool: [String],
-    criticalMissingSkills: [String],
-    hiringRecommendation: String,
+    criticalMissingSkills:  [String],
+    hiringRecommendation:   String,
   },
-  promptVersion: { type: String, default: 'v2.0' },
-  modelUsed:     { type: String, default: 'gemini-1.5-pro' },
-  errorMessage:  { type: String },
+  promptVersion: { type: String, default: 'v3.0' },
+  modelUsed:     { type: String, default: 'gemini-3-flash-preview' },
+  errorMessage:  String,
 }, { timestamps: true });
+
 export default mongoose.model<IScreeningResult>('ScreeningResult', ScreeningResultSchema);
