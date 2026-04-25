@@ -270,8 +270,15 @@ export async function runAIScreening(
         `Candidates batch ${batchNum}`
       );
 
-      if (!parsed.candidates || !Array.isArray(parsed.candidates) || !parsed.candidates.length)
-        throw new Error(`No candidates array. Keys: ${Object.keys(parsed).join(', ')}`);
+      // Model may return array directly OR wrapped in {candidates:[...]}
+      const candidateList = Array.isArray(parsed)
+        ? parsed
+        : (parsed.candidates || parsed.results || parsed.data || []);
+
+      if (!Array.isArray(candidateList) || candidateList.length === 0)
+        throw new Error(`No candidates found. Keys: ${Object.keys(parsed).join(', ')}`);
+
+      parsed.candidates = candidateList;
 
       console.log(`  📊 ${parsed.candidates.length} candidates in response`);
 
