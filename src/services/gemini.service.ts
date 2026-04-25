@@ -5,21 +5,22 @@ import { IJob } from '../models/Job.model';
 // Primary: Groq (free, 14,400 req/day, no credit card)
 // Fallback: Gemini (if Groq fails)
 const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1/models';
+const GEMINI_V1    = 'https://generativelanguage.googleapis.com/v1/models';
+const GEMINI_V1BETA = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const GROQ_MODELS = [
   'llama-3.3-70b-versatile',
   'llama-3.1-8b-instant',
   'gemma2-9b-it',
 ];
-const GEMINI_MODELS = [
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-2.0-flash-001',      // versioned — separate quota pool
-  'gemini-1.5-flash-001',      // versioned stable — works on v1
-  'gemini-1.5-flash-002',      // versioned stable — works on v1
-  'gemini-1.5-pro-001',        // versioned stable — works on v1
-  'gemini-1.5-pro-002',        // versioned stable — works on v1
+// Models with their correct API endpoint
+// gemini-2.0 → v1 endpoint | gemini-1.5 → v1beta endpoint
+const GEMINI_MODELS: { name: string; base: string }[] = [
+  { name: 'gemini-2.0-flash',      base: GEMINI_V1    },
+  { name: 'gemini-2.0-flash-lite', base: GEMINI_V1    },
+  { name: 'gemini-1.5-flash',      base: GEMINI_V1BETA }, // free: 15 RPM, no billing needed
+  { name: 'gemini-1.5-pro',        base: GEMINI_V1BETA }, // free: 2 RPM
+  { name: 'gemini-1.5-flash-8b',   base: GEMINI_V1BETA }, // free: 15 RPM, highest quota
 ];
 
 export interface SkillGap {
@@ -86,12 +87,12 @@ async function callGroq(prompt: string, modelName: string): Promise<string> {
 }
 
 // ─── Gemini call (REST, fallback) ────────────────────────────────────────────
-async function callGemini(prompt: string, modelName: string): Promise<string> {
+async function callGemini(prompt: string, modelName: string, baseUrl: string): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not set');
 
   const res = await fetch(
-    `${GEMINI_URL}/${modelName}:generateContent?key=${apiKey}`,
+    `${baseUrl}/${modelName}:generateContent?key=${apiKey}`,
     {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -192,8 +193,8 @@ export async function testGeminiConnection(): Promise<{ ok: boolean; model: stri
   if (process.env.GEMINI_API_KEY) {
     for (const m of GEMINI_MODELS) {
       try {
-        await callGemini('Reply with exactly: {"status":"ok"}', m);
-        return { ok: true, model: `gemini/${m}` };
+        await callGemini('Reply with exactly: {"status":"ok"}', m.name, m.base);
+        return { ok: true, model: `gemini/${m.name}` };
       } catch { /* try next */ }
     }
   }
