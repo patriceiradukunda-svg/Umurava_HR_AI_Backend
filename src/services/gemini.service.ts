@@ -94,6 +94,26 @@ async function callAI(prompt: string, label: string): Promise<any> {
         throw new Error(`Gemini API key error: ${lastError}. Check GEMINI_API_KEY on Render.`);
       }
 
+      // 503 = temporary server overload — wait 5s and retry same model
+      if (status === 503 || lastError.includes('503')) {
+        console.log(`  ⏳ 503 on ${modelName} — waiting 5s then retrying…`);
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+          console.log(`  🔄 Retrying ${modelName} after 503…`);
+          const model2 = genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig: { responseMimeType: 'application/json', temperature: 0.1, maxOutputTokens: 8192 },
+          });
+          const result2  = await model2.generateContent(prompt);
+          const text2    = result2.response.text();
+          if (text2 && text2.length > 10) {
+            const parsed2 = JSON.parse(text2);
+            console.log(`  ✅ Retry succeeded with ${modelName}`);
+            return parsed2;
+          }
+        } catch { /* fall through to next model */ }
+      }
+
       // 429 or 404 — try next model
       continue;
     }
