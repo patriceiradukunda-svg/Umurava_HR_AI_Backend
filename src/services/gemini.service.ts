@@ -1,17 +1,25 @@
 import { IApplicant } from '../models/Applicant.model';
 import { IJob } from '../models/Job.model';
 
-// ─── No SDK — direct REST API call ───────────────────────────────────────────
-// This bypasses @google/generative-ai entirely, so SDK version doesn't matter.
-// Gemini REST API: POST /v1/models/{model}:generateContent?key={API_KEY}
+// ─── Provider config ─────────────────────────────────────────────────────────
+// Primary: Groq (free, 14,400 req/day, no credit card)
+// Fallback: Gemini (if Groq fails)
+const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1/models';
 
-const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1/models';
-const MODEL_LIST  = [
+const GROQ_MODELS = [
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+  'gemma2-9b-it',
+];
+const GEMINI_MODELS = [
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
-  'gemini-1.5-flash-8b',       // highest free-tier quota limit
-  'gemini-1.5-flash-8b-latest',
-  'gemini-2.0-flash-exp',
+  'gemini-2.0-flash-001',      // versioned — separate quota pool
+  'gemini-1.5-flash-001',      // versioned stable — works on v1
+  'gemini-1.5-flash-002',      // versioned stable — works on v1
+  'gemini-1.5-pro-001',        // versioned stable — works on v1
+  'gemini-1.5-pro-002',        // versioned stable — works on v1
 ];
 
 export interface SkillGap {
@@ -46,115 +54,157 @@ export const DEFAULT_WEIGHTS: ScreeningWeights = {
   projectRelevance: 10, availabilityBonus: 5,
 };
 
-// ─── Raw REST call to Gemini ──────────────────────────────────────────────────
-async function callGeminiREST(prompt: string, modelName: string): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+// ─── Groq call (OpenAI-compatible, forces JSON output) ───────────────────────
+async function callGroq(prompt: string, modelName: string): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY not set');
 
-  const url  = `${GEMINI_BASE}/${modelName}:generateContent?key=${apiKey}`;
-  const body = JSON.stringify({
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature:     0.1,
-      topP:            0.8,
-      maxOutputTokens: 8192,
-    },
-  });
-
-  const res = await fetch(url, {
+  const res = await fetch(GROQ_URL, {
     method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model:           modelName,
+      messages:        [{ role: 'user', content: prompt }],
+      temperature:     0.1,
+      max_tokens:      8000,
+      response_format: { type: 'json_object' }, // forces valid JSON output
+    }),
   });
 
   const data: any = await res.json();
-
   if (!res.ok) {
-    const errMsg = data?.error?.message || data?.error?.status || JSON.stringify(data);
-    throw new Error(`HTTP ${res.status}: ${errMsg}`);
+    const msg = data?.error?.message || JSON.stringify(data);
+    throw new Error(`HTTP ${res.status}: ${msg}`);
   }
 
-  // Check finish reason
-  const candidate   = data?.candidates?.[0];
-  const finishReason = candidate?.finishReason;
-  if (finishReason === 'SAFETY') throw new Error('Response blocked by safety filter');
-
-  const text = candidate?.content?.parts?.[0]?.text || '';
-  if (!text) throw new Error(`Empty response. finishReason: ${finishReason}, keys: ${Object.keys(data).join(',')}`);
-
+  const text = data?.choices?.[0]?.message?.content || '';
+  if (!text) throw new Error('Empty response from Groq');
   return text;
 }
 
-// ─── Try each model with retries ──────────────────────────────────────────────
-async function callWithFallback(prompt: string, label: string): Promise<any> {
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY is not set. Add it in Render → Environment variables.');
+// ─── Gemini call (REST, fallback) ────────────────────────────────────────────
+async function callGemini(prompt: string, modelName: string): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+
+  const res = await fetch(
+    `${GEMINI_URL}/${modelName}:generateContent?key=${apiKey}`,
+    {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents:         [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 8192 },
+      }),
+    }
+  );
+
+  const data: any = await res.json();
+  if (!res.ok) {
+    const msg = data?.error?.message || JSON.stringify(data);
+    throw new Error(`HTTP ${res.status}: ${msg}`);
   }
 
-  let lastError = '';
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  if (!text) throw new Error('Empty response from Gemini');
+  return text;
+}
 
-  for (const modelName of MODEL_LIST) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        console.log(`  🤖 ${label} | ${modelName} | attempt ${attempt}`);
-        const rawText = await callGeminiREST(prompt, modelName);
-        console.log(`  📄 ${rawText.length} chars | model: ${modelName}`);
+// ─── Try all providers ────────────────────────────────────────────────────────
+async function callAI(prompt: string, label: string): Promise<any> {
+  const hasGroq   = !!process.env.GROQ_API_KEY;
+  const hasGemini = !!process.env.GEMINI_API_KEY;
 
-        if (rawText.length < 20) throw new Error(`Response too short: "${rawText}"`);
+  if (!hasGroq && !hasGemini) {
+    throw new Error('No API key found. Set GROQ_API_KEY or GEMINI_API_KEY on Render.');
+  }
 
-        const parsed = extractJSON(rawText);
-        console.log(`  ✅ ${label} succeeded with ${modelName}`);
-        return parsed;
-
-      } catch (err: any) {
-        lastError = err?.message || String(err);
-        console.error(`  ❌ ${modelName} attempt ${attempt}: ${lastError.substring(0, 150)}`);
-
-        // Auth/billing errors — stop immediately
-        if (lastError.includes('API_KEY_INVALID') ||
-            lastError.includes('HTTP 400') ||
-            lastError.includes('HTTP 401') ||
-            lastError.includes('HTTP 403')) {
-          throw new Error(
-            `Gemini API key error. Error: ${lastError}. ` +
-            `Get a new key at aistudio.google.com/app/apikey`
-          );
-        }
-
-        // 429 = rate limited — wait 65 seconds then retry once
-        if (lastError.includes('HTTP 429') || lastError.includes('quota')) {
-          if (attempt < 2) {
-            console.log(`  ⏳ Rate limited (429) — waiting 65s for quota reset…`);
-            await new Promise(r => setTimeout(r, 65000));
-          } else {
-            console.log(`  ⏱️  429 on attempt 2 — skipping to next model`);
+  // Try Groq first (more reliable free tier)
+  if (hasGroq) {
+    for (const model of GROQ_MODELS) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          console.log(`  🤖 [GROQ] ${label} | ${model} | attempt ${attempt}`);
+          const text   = await callGroq(prompt, model);
+          const parsed = extractJSON(text);
+          console.log(`  ✅ [GROQ] Success with ${model}`);
+          return parsed;
+        } catch (err: any) {
+          const msg  = err?.message || String(err);
+          const code = msg.match(/HTTP (\d+)/)?.[1];
+          console.error(`  ❌ [GROQ] ${model} attempt ${attempt}: ${msg.substring(0, 100)}`);
+          if (code === '401' || code === '403') break; // bad key — skip Groq entirely
+          if (code === '429') {
+            if (attempt < 2) { await sleep(60000); continue; }
+            break; // quota — try next model
           }
-          continue;
-        }
-
-        // 404 = model not found on this API version — skip immediately
-        if (lastError.includes('HTTP 404') || lastError.includes('not found')) {
-          break; // next model
-        }
-
-        if (attempt < 2) {
-          console.log(`  ⏳ Waiting 5s before retry…`);
-          await new Promise(r => setTimeout(r, 5000));
+          if (attempt < 2) await sleep(3000);
         }
       }
     }
-    // 404 = model not available in this region/plan → try next model
+  }
+
+  // Fallback: Gemini
+  if (hasGemini) {
+    for (const model of GEMINI_MODELS) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          console.log(`  🤖 [GEMINI] ${label} | ${model} | attempt ${attempt}`);
+          const text   = await callGemini(prompt, model);
+          const parsed = extractJSON(text);
+          console.log(`  ✅ [GEMINI] Success with ${model}`);
+          return parsed;
+        } catch (err: any) {
+          const msg  = err?.message || String(err);
+          const code = msg.match(/HTTP (\d+)/)?.[1];
+          console.error(`  ❌ [GEMINI] ${model} attempt ${attempt}: ${msg.substring(0, 100)}`);
+          if (code === '401' || code === '403') break;
+          if (code === '429') {
+            if (attempt < 2) { await sleep(65000); continue; }
+            break;
+          }
+          if (code === '404') break; // model not found — try next
+          if (attempt < 2) await sleep(3000);
+        }
+      }
+    }
   }
 
   throw new Error(
-    `All models failed for "${label}". Last error: ${lastError}. ` +
-    `Check Render logs for per-model errors above.`
+    `All AI providers failed for "${label}". ` +
+    `Set GROQ_API_KEY from console.groq.com (free, no credit card).`
   );
+}
+
+// ─── Test connection ─────────────────────────────────────────────────────────
+export async function testGeminiConnection(): Promise<{ ok: boolean; model: string; error?: string }> {
+  if (process.env.GROQ_API_KEY) {
+    for (const m of GROQ_MODELS) {
+      try {
+        await callGroq('{"test":"ok"}', m);
+        return { ok: true, model: `groq/${m}` };
+      } catch { /* try next */ }
+    }
+  }
+  if (process.env.GEMINI_API_KEY) {
+    for (const m of GEMINI_MODELS) {
+      try {
+        await callGemini('Reply with exactly: {"status":"ok"}', m);
+        return { ok: true, model: `gemini/${m}` };
+      } catch { /* try next */ }
+    }
+  }
+  return { ok: false, model: '', error: 'All providers failed. Check API keys on Render.' };
 }
 
 // ─── JSON extractor ──────────────────────────────────────────────────────────
 function extractJSON(raw: string): any {
-  let text = raw.trim().replace(/```[\w]*\n?/gi, '').replace(/```/g, '').trim();
+  // Groq with response_format:json_object returns clean JSON — try direct parse first
+  try { return JSON.parse(raw.trim()); } catch { /* continue */ }
+  const text = raw.trim().replace(/```[\w]*\n?/gi, '').replace(/```/g, '').trim();
   try { return JSON.parse(text); } catch { /* continue */ }
   const s = text.indexOf('{'), e = text.lastIndexOf('}');
   if (s !== -1 && e > s) {
@@ -162,7 +212,7 @@ function extractJSON(raw: string): any {
     for (let i = e; i > s; i--)
       if (text[i] === '}') { try { return JSON.parse(text.substring(s, i + 1)); } catch { /* shrink */ } }
   }
-  throw new Error(`JSON parse failed. Preview: "${text.substring(0, 200)}"`);
+  throw new Error(`JSON parse failed. Preview: "${raw.substring(0, 200)}"`);
 }
 
 // ─── ID remapper ─────────────────────────────────────────────────────────────
@@ -174,10 +224,7 @@ function remapIds(aiCands: any[], batch: IApplicant[]): any[] {
     const id = (a._id as any).toString();
     byId.set(id, id);
     if (a.talentProfile.email) byEmail.set(a.talentProfile.email.toLowerCase(), id);
-    byName.set(
-      `${a.talentProfile.firstName.toLowerCase()}|${a.talentProfile.lastName.toLowerCase()}`,
-      id
-    );
+    byName.set(`${a.talentProfile.firstName.toLowerCase()}|${a.talentProfile.lastName.toLowerCase()}`, id);
   }
   return aiCands.map(c => {
     const aiId = String(c.applicantId || '');
@@ -191,7 +238,7 @@ function remapIds(aiCands: any[], batch: IApplicant[]): any[] {
   });
 }
 
-// ─── Profile text ─────────────────────────────────────────────────────────────
+// ─── Profile text ────────────────────────────────────────────────────────────
 function profileText(a: IApplicant, idx: number): string {
   const p = a.talentProfile;
   const totalExp = p.experience.reduce((acc, e) => {
@@ -202,7 +249,7 @@ function profileText(a: IApplicant, idx: number): string {
     } catch { return acc; }
   }, 0);
   const skills = p.skills.map(s => `${s.name}(${s.level},${s.yearsOfExperience}y)`).join(', ') || 'none';
-  const exp    = p.experience.slice(0, 2).map(e =>
+  const exp    = p.experience.slice(0,2).map(e =>
     `${e.role}@${e.company}(${e.startDate}-${e.isCurrent?'now':e.endDate})[${(e.technologies||[]).join(',')}]: ${(e.description||'').substring(0,100)}`
   ).join(' | ');
   const edu    = p.education.map(e => `${e.degree} ${e.fieldOfStudy}@${e.institution}(${e.endYear})`).join(', ');
@@ -216,11 +263,11 @@ Edu:${edu||'none'} | Certs:${certs}
 Projects:${projs||'none'} | Availability:${p.availability?.status||'unknown'}`;
 }
 
-// ─── Prompts ──────────────────────────────────────────────────────────────────
+// ─── Prompts ─────────────────────────────────────────────────────────────────
 function candidatesPrompt(job: IJob, batch: IApplicant[], w: ScreeningWeights): string {
   const ws       = Object.values(w).reduce((a, b) => a + b, 0);
   const profiles = batch.map((a, i) => profileText(a, i + 1)).join('\n\n');
-  return `Evaluate these ${batch.length} candidates for this job. Return ONLY valid JSON.
+  return `Evaluate these ${batch.length} job candidates and return a JSON object.
 
 JOB: ${job.title} | ${job.department} | Min ${job.minimumExperienceYears}yr exp
 REQUIRED SKILLS: ${job.requiredSkills.join(', ')}
@@ -228,62 +275,73 @@ DESCRIPTION: ${job.description.substring(0,300)}
 ${job.screeningNotes ? `HR NOTES: ${job.screeningNotes}` : ''}
 
 matchScore = (skillsMatch×${w.skillsMatch} + experienceMatch×${w.experienceMatch} + educationMatch×${w.educationMatch} + projectRelevance×${w.projectRelevance} + availabilityBonus×${w.availabilityBonus}) / ${ws}
+availabilityBonus: Immediately=100, Open=70, else=30
 
 ${profiles}
 
-Return JSON for ALL ${batch.length} candidates (no markdown, no explanation):
-{"candidates":[{"applicantId":"copy id: field exactly","firstName":"","lastName":"","email":"","location":"","headline":"","availability":{"status":"","type":""},"matchScore":0,"scoreBreakdown":{"skillsMatch":0,"experienceMatch":0,"educationMatch":0,"projectRelevance":0,"availabilityBonus":0},"strengths":["s1","s2","s3"],"gaps":["g1","g2"],"shortlistedReason":"2 sentence reason","skillGaps":["sk1"],"growthAreas":["a1"],"courseRecommendations":["c1"],"recommendation":"final recommendation","skillScores":[{"name":"skill","score":0}]}]}`;
+Return a JSON object with this exact structure for ALL ${batch.length} candidates:
+{
+  "candidates": [
+    {
+      "applicantId": "copy id: field exactly as shown",
+      "firstName": "", "lastName": "", "email": "", "location": "", "headline": "",
+      "availability": {"status":"","type":""},
+      "matchScore": 0,
+      "scoreBreakdown": {"skillsMatch":0,"experienceMatch":0,"educationMatch":0,"projectRelevance":0,"availabilityBonus":0},
+      "strengths": ["strength 1","strength 2","strength 3"],
+      "gaps": ["gap 1","gap 2"],
+      "shortlistedReason": "2 sentence explanation",
+      "skillGaps": ["missing skill"],
+      "growthAreas": ["growth area"],
+      "courseRecommendations": ["Course — why it helps"],
+      "recommendation": "final hiring recommendation",
+      "skillScores": [{"name":"required skill","score":0}]
+    }
+  ]
+}`;
 }
 
 function insightsPrompt(job: IJob, candidates: any[]): string {
-  const summary = candidates.slice(0,20).map(c =>
+  const summary = candidates.slice(0,15).map(c =>
     `${c.firstName} ${c.lastName}: score=${c.matchScore}, gaps=${(c.skillGaps||[]).join(',')}`
   ).join('\n');
-  return `Analyse this talent pool for: ${job.title}
-Required: ${job.requiredSkills.join(', ')}
-Results:\n${summary}
+  return `Analyse this talent pool for the job: ${job.title}
+Required skills: ${job.requiredSkills.join(', ')}
 
-Return ONLY JSON (no markdown):
-{"overallSkillGaps":[{"skill":"","coverage":0,"severity":"moderate","recommendation":""}],"marketRecommendations":["rec1","rec2"],"pipelineHealth":"summary paragraph","topStrengthsAcrossPool":["str1"],"criticalMissingSkills":["sk1"],"hiringRecommendation":"overall recommendation"}`;
+Candidate results:
+${summary}
+
+Return a JSON object:
+{
+  "overallSkillGaps": [{"skill":"","coverage":0,"severity":"moderate","recommendation":""}],
+  "marketRecommendations": ["recommendation 1","recommendation 2"],
+  "pipelineHealth": "one paragraph about pool quality",
+  "topStrengthsAcrossPool": ["common strength"],
+  "criticalMissingSkills": ["skill nobody has"],
+  "hiringRecommendation": "overall strategic recommendation"
+}`;
 }
 
-// ─── Test connection ──────────────────────────────────────────────────────────
-export async function testGeminiConnection(): Promise<{ ok: boolean; model: string; error?: string }> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return { ok: false, model: '', error: 'GEMINI_API_KEY not set' };
-
-  for (const m of MODEL_LIST) {
-    try {
-      const text = await callGeminiREST('Reply with exactly: {"status":"ok"}', m);
-      console.log(`✅ Gemini REST OK — model: ${m}`);
-      return { ok: true, model: m };
-    } catch (err: any) {
-      console.warn(`⚠️  ${m}: ${err?.message?.substring(0,80)}`);
-    }
-  }
-  return { ok: false, model: '', error: 'All models failed via REST' };
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main ────────────────────────────────────────────────────────────────────
 export async function runAIScreening(
   job: IJob,
   applicants: IApplicant[],
   weights: ScreeningWeights = DEFAULT_WEIGHTS,
   shortlistSize: number = 10,
-  _modelName = 'gemini-2.0-flash'
+  _modelName = 'groq'
 ): Promise<{
   shortlist: CandidateResult[]; allCandidates: CandidateResult[];
   insights: ScreeningInsights; totalEvaluated: number;
   averageScore: number; topScore: number;
 }> {
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY is not set. Add it in Render → Environment variables.');
+  if (!process.env.GROQ_API_KEY && !process.env.GEMINI_API_KEY) {
+    throw new Error('No API key configured. Add GROQ_API_KEY from console.groq.com to Render Environment.');
   }
 
   const BATCH_SIZE   = 8;
   const totalBatches = Math.ceil(applicants.length / BATCH_SIZE);
   let allCandidates: any[] = [];
-  let failedBatches        = 0;
+  let failedBatches = 0;
 
   // CALL 1: Evaluate candidates
   for (let i = 0; i < applicants.length; i += BATCH_SIZE) {
@@ -292,17 +350,14 @@ export async function runAIScreening(
     console.log(`\n📦 Batch ${batchNum}/${totalBatches} — ${batch.length} candidates`);
 
     try {
-      const parsed = await callWithFallback(
-        candidatesPrompt(job, batch, weights),
-        `Candidates batch ${batchNum}`
-      );
-      if (!parsed.candidates || !Array.isArray(parsed.candidates) || !parsed.candidates.length)
-        throw new Error(`No candidates array. Keys: ${Object.keys(parsed).join(', ')}`);
+      const parsed = await callAI(candidatesPrompt(job, batch, weights), `Candidates batch ${batchNum}`);
 
-      const remapped  = remapIds(parsed.candidates, batch);
-      const validated = remapped.map((c: any) => ({
+      if (!parsed.candidates || !Array.isArray(parsed.candidates) || !parsed.candidates.length)
+        throw new Error(`No candidates in response. Keys: ${Object.keys(parsed).join(', ')}`);
+
+      const validated = remapIds(parsed.candidates, batch).map((c: any) => ({
         ...c,
-        matchScore:  clamp(c.matchScore),
+        matchScore: clamp(c.matchScore),
         scoreBreakdown: {
           skillsMatch:       clamp(c.scoreBreakdown?.skillsMatch),
           experienceMatch:   clamp(c.scoreBreakdown?.experienceMatch),
@@ -327,18 +382,12 @@ export async function runAIScreening(
 
     } catch (err: any) {
       failedBatches++;
-      const msg = err?.message || String(err);
-      console.error(`❌ Batch ${batchNum} failed: ${msg}`);
-      if (msg.includes('API key') || msg.includes('not set')) throw err;
+      console.error(`❌ Batch ${batchNum} failed: ${err?.message}`);
     }
   }
 
-  if (allCandidates.length === 0) {
-    throw new Error(
-      `Screening produced no results — all ${totalBatches} batch(es) failed. ` +
-      `Check Render logs above for the specific error on each model.`
-    );
-  }
+  if (allCandidates.length === 0)
+    throw new Error(`All ${totalBatches} batch(es) failed. Check Render logs for details.`);
 
   // Sort → shortlist
   allCandidates.sort((a, b) => b.matchScore - a.matchScore);
@@ -353,7 +402,7 @@ export async function runAIScreening(
   let insights: ScreeningInsights = defaultInsights(job);
   try {
     console.log('\n🔍 Generating pool insights…');
-    const parsed = await callWithFallback(insightsPrompt(job, allCandidates), 'Pool insights');
+    const parsed = await callAI(insightsPrompt(job, allCandidates), 'Pool insights');
     if (parsed.hiringRecommendation || parsed.pipelineHealth) {
       insights = {
         overallSkillGaps:       arr(parsed.overallSkillGaps),
@@ -369,25 +418,24 @@ export async function runAIScreening(
     console.warn(`⚠️  Insights failed (non-fatal): ${err?.message?.substring(0,80)}`);
   }
 
-  const scores   = allCandidates.map(c => c.matchScore);
-  const avg      = scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : 0;
-  const top      = scores.length ? Math.max(...scores) : 0;
-
+  const scores = allCandidates.map(c => c.matchScore);
   return {
     shortlist: shortlisted, allCandidates: finalAll, insights,
-    totalEvaluated: allCandidates.length, averageScore: avg, topScore: top,
+    totalEvaluated: allCandidates.length,
+    averageScore:   scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : 0,
+    topScore:       scores.length ? Math.max(...scores) : 0,
   };
 }
 
-const clamp = (v: any) => Math.min(100, Math.max(0, Math.round(Number(v)||0)));
-const arr   = (v: any) => Array.isArray(v) ? v : [];
+const clamp  = (v: any) => Math.min(100, Math.max(0, Math.round(Number(v)||0)));
+const arr    = (v: any) => Array.isArray(v) ? v : [];
+const sleep  = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 function defaultInsights(job: IJob): ScreeningInsights {
   return {
-    overallSkillGaps: [], criticalMissingSkills: [],
-    topStrengthsAcrossPool: [],
+    overallSkillGaps: [], criticalMissingSkills: [], topStrengthsAcrossPool: [],
     marketRecommendations:  [`Source candidates with: ${job.requiredSkills.slice(0,3).join(', ')}`],
-    pipelineHealth:         'Screening completed. Review shortlisted candidates.',
+    pipelineHealth:         'Screening completed successfully.',
     hiringRecommendation:   'Review shortlisted candidates and proceed with interviews.',
   };
 }
