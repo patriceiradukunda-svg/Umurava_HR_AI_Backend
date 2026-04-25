@@ -8,13 +8,14 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-// Preview models have separate quota pools — use these first
+// gemini-3-flash-preview was your original working model — keep it first
 const MODELS = [
+  'gemini-3-flash-preview',
   'gemini-2.5-flash-preview-04-17',
-  'gemini-2.5-pro-preview-03-25',
-  'gemini-2.0-flash-thinking-exp',
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
 ];
 
 export interface SkillGap {
@@ -49,54 +50,84 @@ export const DEFAULT_WEIGHTS: ScreeningWeights = {
   projectRelevance: 10, availabilityBonus: 5,
 };
 
-// ─── Get a working model (tries each until one succeeds) ─────────────────────
-async function getModel(): Promise<{ model: any; name: string }> {
-  for (const name of MODELS) {
+// ─── Call AI — NO pre-ping, go straight to real call ─────────────────────────
+async function callAI(prompt: string, label: string): Promise<any> {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY not set on Render.');
+  }
+
+  let lastError = '';
+
+  for (const modelName of MODELS) {
     try {
+      console.log(`  🤖 ${label} | ${modelName}`);
+
       const model = genAI.getGenerativeModel({
-        model: name,
+        model: modelName,
         generationConfig: {
-          responseMimeType: 'application/json', // forces clean JSON — no parsing needed
+          responseMimeType: 'application/json', // forces clean JSON — no parsing errors
           temperature:      0.1,
           maxOutputTokens:  8192,
         },
       });
-      // Quick ping to confirm model is available
-      const test = await model.generateContent('{"test":true}');
-      test.response.text(); // throws if model unavailable
-      console.log(`  ✅ Using model: ${name}`);
-      return { model, name };
+
+      const result      = await model.generateContent(prompt);
+      const text        = result.response.text();
+      const finishReason = result.response.candidates?.[0]?.finishReason;
+
+      console.log(`  📄 ${text.length} chars | finish: ${finishReason || 'STOP'} | model: ${modelName}`);
+
+      if (!text || text.length < 10) throw new Error('Empty response');
+
+      const parsed = JSON.parse(text); // responseMimeType guarantees valid JSON
+      console.log(`  ✅ Success with ${modelName}`);
+      return parsed;
+
     } catch (err: any) {
-      const code = err?.status || err?.message?.match(/\[(\d+)/)?.[1];
-      console.warn(`  ⚠️  ${name} unavailable [${code}]: ${err?.message?.substring(0, 60)}`);
-      // Auth error — no point trying more
-      if (code === 400 || code === 401 || code === 403) {
-        throw new Error(`API key error [${code}]. Check GEMINI_API_KEY on Render.`);
+      lastError = err?.message || String(err);
+      const status = err?.status || err?.response?.status;
+      console.error(`  ❌ ${modelName}: [${status || '?'}] ${lastError.substring(0, 100)}`);
+
+      // Auth error — stop immediately
+      if (status === 400 || status === 401 || status === 403 ||
+          lastError.includes('API_KEY_INVALID') || lastError.includes('API key')) {
+        throw new Error(`Gemini API key error: ${lastError}. Check GEMINI_API_KEY on Render.`);
       }
+
+      // 429 or 404 — try next model
+      continue;
     }
   }
+
   throw new Error(
-    'No Gemini model available. All models returned 404 or 429. ' +
-    'Enable the Generative Language API at console.cloud.google.com → APIs & Services.'
+    `All Gemini models failed for "${label}". Last error: ${lastError}. ` +
+    `Check that GEMINI_API_KEY is valid at aistudio.google.com/app/apikey`
   );
 }
 
-// ─── Call model with retries ──────────────────────────────────────────────────
-async function callModel(model: any, modelName: string, prompt: string, label: string): Promise<any> {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      console.log(`  🤖 ${label} | ${modelName} | attempt ${attempt}`);
-      const result = await model.generateContent(prompt);
-      const text   = result.response.text();
-      console.log(`  📄 ${text.length} chars`);
-      if (!text || text.length < 10) throw new Error('Empty response');
-      // With responseMimeType:'application/json', response is always valid JSON
-      return JSON.parse(text);
-    } catch (err: any) {
-      console.error(`  ❌ attempt ${attempt}: ${err?.message?.substring(0, 100)}`);
-      if (attempt < 2) await sleep(3000);
-      else throw err;
+// ─── Test connection ──────────────────────────────────────────────────────────
+export async function testGeminiConnection(): Promise<{ ok: boolean; model: string; error?: string }> {
+  try {
+    // Use the simplest possible prompt that forces JSON
+    for (const modelName of MODELS) {
+      try {
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: { responseMimeType: 'application/json' },
+        });
+        const result = await model.generateContent('Return {"status":"ok"}');
+        result.response.text();
+        return { ok: true, model: modelName };
+      } catch (err: any) {
+        const status = err?.status;
+        if (status === 400 || status === 401 || status === 403)
+          return { ok: false, model: '', error: `API key error: ${err?.message}` };
+        continue;
+      }
     }
+    return { ok: false, model: '', error: 'All models unavailable' };
+  } catch (err: any) {
+    return { ok: false, model: '', error: err?.message };
   }
 }
 
@@ -136,31 +167,28 @@ Nice to have: ${(job.niceToHaveSkills||[]).join(', ')}
 Description: ${job.description.substring(0,300)}
 ${job.screeningNotes ? `HR Notes: ${job.screeningNotes}` : ''}
 
-Scoring: matchScore = (skillsMatch×${w.skillsMatch} + experienceMatch×${w.experienceMatch} + educationMatch×${w.educationMatch} + projectRelevance×${w.projectRelevance} + availabilityBonus×${w.availabilityBonus}) / ${ws}
-Availability scoring: Immediately=100, Open to Opportunities=70, else=30
+matchScore = (skillsMatch×${w.skillsMatch} + experienceMatch×${w.experienceMatch} + educationMatch×${w.educationMatch} + projectRelevance×${w.projectRelevance} + availabilityBonus×${w.availabilityBonus}) / ${ws}
+Availability: Immediately=100, Open to Opportunities=70, else=30
 
 ${profiles}
 
-Return a JSON object evaluating ALL ${batch.length} candidates:
+Return a JSON object for ALL ${batch.length} candidates:
 {
   "candidates": [
     {
-      "applicantId": "copy the id: field exactly",
+      "applicantId": "copy the id: field exactly as shown above",
       "firstName": "", "lastName": "", "email": "", "location": "", "headline": "",
-      "availability": {"status": "", "type": ""},
+      "availability": {"status":"","type":""},
       "matchScore": 0,
-      "scoreBreakdown": {
-        "skillsMatch": 0, "experienceMatch": 0, "educationMatch": 0,
-        "projectRelevance": 0, "availabilityBonus": 0
-      },
-      "strengths": ["strength 1", "strength 2", "strength 3"],
-      "gaps": ["gap 1", "gap 2"],
-      "shortlistedReason": "2 sentence explanation",
-      "skillGaps": ["missing skill"],
+      "scoreBreakdown": {"skillsMatch":0,"experienceMatch":0,"educationMatch":0,"projectRelevance":0,"availabilityBonus":0},
+      "strengths": ["strength 1","strength 2","strength 3"],
+      "gaps": ["gap 1","gap 2"],
+      "shortlistedReason": "2 sentence explanation of selection decision",
+      "skillGaps": ["missing required skill"],
       "growthAreas": ["area to develop"],
-      "courseRecommendations": ["Course name — what gap it closes"],
+      "courseRecommendations": ["Course name — gap it closes"],
       "recommendation": "final hiring recommendation",
-      "skillScores": [{"name": "skill name", "score": 0}]
+      "skillScores": [{"name":"required skill","score":0}]
     }
   ]
 }`;
@@ -170,7 +198,7 @@ function insightsPrompt(job: IJob, candidates: any[]): string {
   const summary = candidates.slice(0,20).map(c =>
     `${c.firstName} ${c.lastName}: score=${c.matchScore}, gaps=${(c.skillGaps||[]).join(',')}`
   ).join('\n');
-  return `You are an expert HR analyst. Analyse this talent pool for: ${job.title}
+  return `You are an expert HR analyst. Analyse this talent pool for the role: ${job.title}
 Required skills: ${job.requiredSkills.join(', ')}
 
 Candidate results:
@@ -178,8 +206,8 @@ ${summary}
 
 Return a JSON object:
 {
-  "overallSkillGaps": [{"skill": "", "coverage": 0, "severity": "moderate", "recommendation": ""}],
-  "marketRecommendations": ["recommendation 1", "recommendation 2"],
+  "overallSkillGaps": [{"skill":"","coverage":0,"severity":"moderate","recommendation":""}],
+  "marketRecommendations": ["recommendation 1","recommendation 2"],
   "pipelineHealth": "one paragraph describing pool quality",
   "topStrengthsAcrossPool": ["common strength 1"],
   "criticalMissingSkills": ["skill almost nobody has"],
@@ -201,7 +229,7 @@ function remapIds(aiCands: any[], batch: IApplicant[]): any[] {
   return aiCands.map(c => {
     const aiId = String(c.applicantId || '');
     if (byId.has(aiId)) return c;
-    const ek = (c.email || '').toLowerCase();
+    const ek = (c.email||'').toLowerCase();
     if (ek && byEmail.has(ek)) return { ...c, applicantId: byEmail.get(ek) };
     const nk = `${(c.firstName||'').toLowerCase()}|${(c.lastName||'').toLowerCase()}`;
     if (byName.has(nk)) return { ...c, applicantId: byName.get(nk) };
@@ -210,58 +238,42 @@ function remapIds(aiCands: any[], batch: IApplicant[]): any[] {
   });
 }
 
-// ─── Test connection ──────────────────────────────────────────────────────────
-export async function testGeminiConnection(): Promise<{ ok: boolean; model: string; error?: string }> {
-  try {
-    const { name } = await getModel();
-    return { ok: true, model: name };
-  } catch (err: any) {
-    return { ok: false, model: '', error: err?.message };
-  }
-}
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 export async function runAIScreening(
   job: IJob,
   applicants: IApplicant[],
   weights: ScreeningWeights = DEFAULT_WEIGHTS,
   shortlistSize: number = 10,
-  _modelName = 'gemini-2.5-flash-preview-04-17'
+  _modelName = 'gemini-3-flash-preview'
 ): Promise<{
   shortlist: CandidateResult[]; allCandidates: CandidateResult[];
   insights: ScreeningInsights; totalEvaluated: number;
   averageScore: number; topScore: number;
 }> {
   if (!process.env.GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY is not set. Add it in Render → Environment variables.');
+    throw new Error('GEMINI_API_KEY not set. Add it in Render → Environment variables.');
   }
-
-  console.log('\n🔍 Finding available Gemini model…');
-  const { model, name: modelName } = await getModel();
 
   const BATCH_SIZE   = 8;
   const totalBatches = Math.ceil(applicants.length / BATCH_SIZE);
   let allCandidates: any[] = [];
   let failedBatches = 0;
 
-  // CALL 1: Evaluate candidates
   for (let i = 0; i < applicants.length; i += BATCH_SIZE) {
     const batch    = applicants.slice(i, i + BATCH_SIZE);
     const batchNum = Math.floor(i / BATCH_SIZE) + 1;
     console.log(`\n📦 Batch ${batchNum}/${totalBatches} — ${batch.length} candidates`);
 
     try {
-      const parsed = await callModel(
-        model, modelName,
+      const parsed = await callAI(
         candidatesPrompt(job, batch, weights),
         `Candidates batch ${batchNum}`
       );
 
-      if (!parsed.candidates || !Array.isArray(parsed.candidates) || !parsed.candidates.length) {
+      if (!parsed.candidates || !Array.isArray(parsed.candidates) || !parsed.candidates.length)
         throw new Error(`No candidates array. Keys: ${Object.keys(parsed).join(', ')}`);
-      }
 
-      console.log(`  📊 ${parsed.candidates.length} candidates evaluated`);
+      console.log(`  📊 ${parsed.candidates.length} candidates in response`);
 
       const validated = remapIds(parsed.candidates, batch).map((c: any) => ({
         ...c,
@@ -290,31 +302,33 @@ export async function runAIScreening(
 
     } catch (err: any) {
       failedBatches++;
-      console.error(`❌ Batch ${batchNum} failed: ${err?.message}`);
+      const msg = err?.message || String(err);
+      console.error(`❌ Batch ${batchNum} failed: ${msg}`);
+      if (msg.includes('API key') || msg.includes('not set')) throw err;
     }
   }
 
   if (allCandidates.length === 0) {
     throw new Error(
       `Screening produced no results — all ${totalBatches} batch(es) failed. ` +
-      `Model used: ${modelName}. Check Render logs above for details.`
+      `Check Render logs above for per-model errors.`
     );
   }
 
-  // Sort → shortlist
   allCandidates.sort((a, b) => b.matchScore - a.matchScore);
   const sz          = Math.min(shortlistSize, allCandidates.length);
   const shortlisted = allCandidates.slice(0, sz).map((c, i) => ({ ...c, rank: i+1, isShortlisted: true }));
   const rejected    = allCandidates.slice(sz).map(c => ({ ...c, isShortlisted: false }));
   const finalAll    = [...shortlisted, ...rejected];
 
-  console.log(`\n🏆 ${shortlisted.length} shortlisted from ${allCandidates.length} | model: ${modelName}`);
+  console.log(`\n🏆 ${shortlisted.length} shortlisted from ${allCandidates.length}`);
+  if (failedBatches > 0) console.warn(`⚠️  ${failedBatches} batch(es) failed`);
 
-  // CALL 2: Pool insights (non-fatal)
+  // Insights (non-fatal)
   let insights: ScreeningInsights = defaultInsights(job);
   try {
-    console.log('\n🔍 Generating pool insights…');
-    const parsed = await callModel(model, modelName, insightsPrompt(job, allCandidates), 'Pool insights');
+    console.log('\n🔍 Generating insights…');
+    const parsed = await callAI(insightsPrompt(job, allCandidates), 'Pool insights');
     if (parsed.hiringRecommendation || parsed.pipelineHealth) {
       insights = {
         overallSkillGaps:       arr(parsed.overallSkillGaps),
@@ -341,7 +355,6 @@ export async function runAIScreening(
 
 const clamp = (v: any) => Math.min(100, Math.max(0, Math.round(Number(v)||0)));
 const arr   = (v: any) => Array.isArray(v) ? v : [];
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 function defaultInsights(job: IJob): ScreeningInsights {
   return {
