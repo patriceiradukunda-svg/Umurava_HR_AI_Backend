@@ -154,7 +154,7 @@ async function callAI(prompt: string, label: string): Promise<any> {
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
           console.log(`  🤖 [GEMINI] ${label} | ${model} | attempt ${attempt}`);
-          const text   = await callGemini(prompt, model);
+          const text   = await callGemini(prompt, model.name, model.base);
           const parsed = extractJSON(text);
           console.log(`  ✅ [GEMINI] Success with ${model}`);
           return parsed;
