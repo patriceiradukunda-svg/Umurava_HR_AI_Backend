@@ -321,7 +321,16 @@ export async function runAIScreening(
         shortlistedReason:     c.shortlistedReason || '',
         recommendation:        c.recommendation    || '',
         headline:              c.headline          || '',
-        availability:          c.availability      || { status: 'unknown', type: 'Full-time' },
+        // Sanitize availability — AI sometimes puts score number in type field
+        // Schema uses employmentType (not type) to avoid Mongoose reserved word conflict
+        availability: {
+          status: (c.availability?.status && typeof c.availability.status === 'string' && isNaN(Number(c.availability.status)))
+            ? c.availability.status
+            : 'Open to Opportunities',
+          employmentType: (c.availability?.type && typeof c.availability.type === 'string' && isNaN(Number(c.availability.type)))
+            ? c.availability.type
+            : (c.availability?.employmentType || 'Full-time'),
+        },
       }));
 
       allCandidates = [...allCandidates, ...validated];
