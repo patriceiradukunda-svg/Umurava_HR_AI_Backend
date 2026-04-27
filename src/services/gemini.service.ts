@@ -8,7 +8,7 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-// gemini-3-flash-preview was your original working model — keep it first
+// Use only stable, confirmed working models
 const MODELS = [
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
@@ -208,49 +208,57 @@ Return a JSON object for ALL ${batch.length} candidates:
 }`;
 }
 
+// Improved insightsPrompt with better instructions
 function insightsPrompt(job: IJob, candidates: any[]): string {
   // Handle empty candidates
   if (!candidates || candidates.length === 0) {
     return `You are an expert HR analyst. No candidates available for analysis for role: ${job.title}
-Return a JSON object with default values:
+Return EXACTLY this JSON:
 {
   "overallSkillGaps": [],
   "marketRecommendations": ["Run screenings to get AI-powered recommendations"],
-  "pipelineHealth": "No candidates have been screened yet. Run a screening to see insights.",
+  "pipelineHealth": "No candidates have been screened yet.",
   "topStrengthsAcrossPool": [],
   "criticalMissingSkills": [],
   "hiringRecommendation": "Run an AI screening first to generate recommendations."
 }`;
   }
 
-  // Build summary with proper gap handling
-  const summary = candidates.slice(0, 20).map(c => {
+  // Build summary with safe gap handling
+  const summary = candidates.slice(0, 15).map(c => {
     const gaps = (c.skillGaps || c.gaps || []);
-    const gapText = gaps.length > 0 ? gaps.join(', ') : 'No specific gaps identified';
-    return `${c.firstName} ${c.lastName}: score=${c.matchScore}, gaps=${gapText}`;
+    const gapText = gaps.length > 0 ? gaps.slice(0, 3).join(', ') : 'No specific gaps';
+    const strengths = (c.strengths || []).slice(0, 2).join(', ');
+    return `${c.firstName} ${c.lastName}: score=${c.matchScore}, strengths=${strengths || 'none'}, gaps=${gapText}`;
   }).join('\n');
 
+  const requiredSkills = (job.requiredSkills || []).join(', ');
+  
   return `You are an expert HR analyst. Analyze this talent pool for the role: ${job.title}
-Required skills: ${job.requiredSkills.join(', ')}
 
-Candidate results:
+REQUIRED SKILLS: ${requiredSkills}
+
+CANDIDATE SUMMARY:
 ${summary}
 
-IMPORTANT: Return ONLY valid JSON. Do not include any markdown, explanations, or text outside the JSON object.
+INSTRUCTIONS:
+1. Identify which required skills are missing from most candidates
+2. Calculate coverage percentage for each missing skill (how many candidates have this skill)
+3. Provide actionable recommendations
 
-Return a JSON object with this exact structure:
+Return ONLY valid JSON. No markdown, no extra text. Use this exact structure:
 {
   "overallSkillGaps": [
     {"skill": "skill name", "coverage": 45, "severity": "critical", "recommendation": "specific actionable recommendation"}
   ],
   "marketRecommendations": ["recommendation 1", "recommendation 2"],
-  "pipelineHealth": "one paragraph describing pool quality and talent availability",
+  "pipelineHealth": "one paragraph describing pool quality",
   "topStrengthsAcrossPool": ["common strength 1", "common strength 2"],
-  "criticalMissingSkills": ["skill almost nobody has", "another missing skill"],
-  "hiringRecommendation": "overall strategic recommendation for HR"
+  "criticalMissingSkills": ["skill almost nobody has"],
+  "hiringRecommendation": "overall strategic recommendation"
 }
 
-Severity levels: "critical" for <40% coverage, "moderate" for 40-70%, "minor" for >70% coverage.`;
+Severity rules: "critical" if coverage < 40%, "moderate" if 40-70%, "minor" if >70%`;
 }
 
 // ─── ID remapper ──────────────────────────────────────────────────────────────
@@ -375,9 +383,9 @@ export async function runAIScreening(
   console.log(`\n🏆 ${shortlisted.length} shortlisted from ${allCandidates.length}`);
   if (failedBatches > 0) console.warn(`⚠️  ${failedBatches} batch(es) failed`);
 
-  // Generate AI Insights (with improved error handling)
-  let insights: ScreeningInsights = defaultInsights(job);
-  
+  // Generate AI Insights
+  let insights: ScreeningInsights;
+
   try {
     console.log('\n🔍 Generating AI-powered insights...');
     console.log(`📊 Total candidates for insights analysis: ${allCandidates.length}`);
@@ -390,27 +398,30 @@ export async function runAIScreening(
     const parsed = await callAI(insightsPrompt(job, allCandidates), 'Pool insights');
     console.log(`📝 Insights response received with keys: ${Object.keys(parsed).join(', ')}`);
     
-    if (parsed.hiringRecommendation || parsed.pipelineHealth) {
+    if (parsed) {
       insights = {
-        overallSkillGaps: arr(parsed.overallSkillGaps).map((g: any) => ({
+        overallSkillGaps: (parsed.overallSkillGaps || []).map((g: any) => ({
           skill: g.skill || 'Unknown',
-          coverage: g.coverage || 0,
+          coverage: typeof g.coverage === 'number' ? g.coverage : 0,
           severity: g.severity || 'moderate',
           recommendation: g.recommendation || 'Review this skill gap',
         })),
-        marketRecommendations: arr(parsed.marketRecommendations),
+        marketRecommendations: parsed.marketRecommendations || [],
         pipelineHealth: parsed.pipelineHealth || 'Screening completed successfully.',
-        topStrengthsAcrossPool: arr(parsed.topStrengthsAcrossPool),
-        criticalMissingSkills: arr(parsed.criticalMissingSkills),
+        topStrengthsAcrossPool: parsed.topStrengthsAcrossPool || [],
+        criticalMissingSkills: parsed.criticalMissingSkills || [],
         hiringRecommendation: parsed.hiringRecommendation || 'Review shortlisted candidates for interviews.',
       };
-      console.log(`  ✅ AI Insights ready! Found ${insights.overallSkillGaps.length} skill gaps, ${insights.marketRecommendations.length} recommendations`);
+      console.log(`  ✅ AI Insights ready! Found ${insights.overallSkillGaps.length} skill gaps`);
     } else {
-      console.warn('⚠️ Insights response missing expected fields, using defaults');
+      throw new Error('Insights response was empty');
     }
   } catch (err: any) {
     console.error(`❌ Insights generation failed: ${err?.message}`);
-    console.log('📋 Using default insights. This is non-fatal - screening results are still valid.');
+    console.log('📋 Using generated insights based on candidate data');
+    
+    // Generate insights from candidate data instead of AI
+    insights = generateInsightsFromCandidates(job, allCandidates);
   }
 
   const scores = allCandidates.map(c => c.matchScore);
@@ -424,16 +435,78 @@ export async function runAIScreening(
   };
 }
 
-const clamp = (v: any) => Math.min(100, Math.max(0, Math.round(Number(v) || 0)));
-const arr = (v: any) => Array.isArray(v) ? v : [];
-
-function defaultInsights(job: IJob): ScreeningInsights {
+// Fallback: Generate insights from candidate data without AI
+function generateInsightsFromCandidates(job: IJob, candidates: any[]): ScreeningInsights {
+  const requiredSkills = job.requiredSkills || [];
+  const skillCoverage: Record<string, { count: number; total: number }> = {};
+  
+  // Initialize skill coverage tracking
+  requiredSkills.forEach(skill => {
+    skillCoverage[skill] = { count: 0, total: 0 };
+  });
+  
+  // Calculate skill coverage from candidates
+  candidates.forEach(candidate => {
+    const candidateSkills = (candidate.skillScores || []).map((s: any) => s.name);
+    requiredSkills.forEach(skill => {
+      skillCoverage[skill].total++;
+      if (candidateSkills.includes(skill)) {
+        skillCoverage[skill].count++;
+      }
+    });
+  });
+  
+  // Build skill gaps
+  const overallSkillGaps: SkillGap[] = Object.entries(skillCoverage)
+    .map(([skill, data]) => {
+      const coverage = data.total > 0 ? Math.round((data.count / data.total) * 100) : 0;
+      let severity: 'critical' | 'moderate' | 'minor' = 'moderate';
+      if (coverage < 40) severity = 'critical';
+      else if (coverage > 70) severity = 'minor';
+      
+      let recommendation = '';
+      if (coverage < 40) {
+        recommendation = `Critical gap: ${skill} missing in ${100 - coverage}% of candidates. Consider hiring or training.`;
+      } else if (coverage < 70) {
+        recommendation = `Moderate gap: ${skill} needs improvement. Include in technical assessments.`;
+      } else {
+        recommendation = `Good coverage of ${skill}. Maintain current standards.`;
+      }
+      
+      return { skill, coverage, severity, recommendation };
+    })
+    .filter(g => g.coverage < 80) // Only show gaps, not strengths
+    .sort((a, b) => a.coverage - b.coverage);
+  
+  const criticalMissingSkills = overallSkillGaps
+    .filter(g => g.severity === 'critical')
+    .map(g => g.skill);
+  
+  const topStrengthsAcrossPool = Object.entries(skillCoverage)
+    .filter(([_, data]) => data.total > 0 && (data.count / data.total) > 0.7)
+    .map(([skill]) => skill)
+    .slice(0, 3);
+  
+  const marketRecommendations = [
+    `Focus on recruiting candidates with ${criticalMissingSkills.slice(0, 2).join(', ')} skills`,
+    `Consider training programs for ${overallSkillGaps.slice(0, 2).map(g => g.skill).join(', ')}`,
+  ];
+  
+  const pipelineHealth = `Evaluated ${candidates.length} candidates. Found ${overallSkillGaps.length} skill gaps. ${criticalMissingSkills.length > 0 ? 'Critical gaps identified in ' + criticalMissingSkills.join(', ') + '.' : 'Good skill coverage overall.'}`;
+  
+  const hiringRecommendation = criticalMissingSkills.length > 0 
+    ? `Priority: Hire candidates with ${criticalMissingSkills.slice(0, 2).join(', ')} skills or provide immediate training.`
+    : `Proceed with interviews for top ${Math.min(5, candidates.length)} candidates.`;
+  
   return {
-    overallSkillGaps: [],
-    criticalMissingSkills: [],
-    topStrengthsAcrossPool: [],
-    marketRecommendations: [`Source candidates with: ${job.requiredSkills.slice(0, 3).join(', ')}`],
-    pipelineHealth: 'Screening completed. Review shortlisted candidates.',
-    hiringRecommendation: 'Review shortlisted candidates and proceed with interviews.',
+    overallSkillGaps,
+    marketRecommendations,
+    pipelineHealth,
+    topStrengthsAcrossPool,
+    criticalMissingSkills,
+    hiringRecommendation,
   };
 }
+
+const clamp = (v: any) => Math.min(100, Math.max(0, Math.round(Number(v) || 0)));
+const arr = (v: any) => Array.isArray(v) ? v : [];
