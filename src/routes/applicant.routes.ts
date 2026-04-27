@@ -1,37 +1,10 @@
 import { Router, Response } from 'express';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
 import { protect, AuthRequest } from '../middleware/auth.middleware';
 import Applicant from '../models/Applicant.model';
 import Job from '../models/Job.model';
-import { parseCSV, parseXLSX, parsePDF, getFileType, ParsedApplicant } from '../services/fileParser.service';
 
 const router = Router();
 router.use(protect);
-
-// ── Multer config ────────────────────────────────────────────────────────────
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const dir = path.join(__dirname, '../../uploads');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (_req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 20 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    const allowed = ['.csv', '.xlsx', '.xls', '.pdf'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(ext)) cb(null, true);
-    else cb(new Error('Only CSV, Excel, and PDF files are allowed'));
-  },
-});
 
 // ── GET /api/applicants ──────────────────────────────────────────────────────
 router.get('/', async (req: AuthRequest, res: Response) => {
@@ -54,7 +27,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
 
     const [applicants, total] = await Promise.all([
       Applicant.find(filter)
-        .populate('jobId', 'title department location type status minimumExperienceYears')
+        .populate('jobId', 'title department location type status minimumExperienceYears applicationDeadline createdAt')
         .sort({ appliedAt: -1 })
         .skip(skip)
         .limit(Number(limit)),
@@ -96,7 +69,7 @@ router.get('/stats', async (_req: AuthRequest, res: Response) => {
 router.get('/:id', async (req: AuthRequest, res: Response) => {
   try {
     const applicant = await Applicant.findById(req.params.id)
-      .populate('jobId', 'title department location type status minimumExperienceYears');
+      .populate('jobId', 'title department location type status minimumExperienceYears applicationDeadline createdAt');
     if (!applicant) {
       res.status(404).json({ success: false, message: 'Applicant not found' });
       return;
@@ -139,7 +112,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
 
     // Return with populated jobId so frontend can display job title immediately
     const populated = await Applicant.findById(applicant._id)
-      .populate('jobId', 'title department location type status minimumExperienceYears');
+      .populate('jobId', 'title department location type status minimumExperienceYears applicationDeadline createdAt');
 
     res.status(201).json({ success: true, data: populated });
   } catch (err: any) {
@@ -149,67 +122,6 @@ router.post('/', async (req: AuthRequest, res: Response) => {
       return;
     }
     res.status(500).json({ success: false, message: 'Failed to submit application' });
-  }
-});
-
-// ── POST /api/applicants/bulk-upload ─────────────────────────────────────────
-router.post('/bulk-upload', upload.single('file'), async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.file) {
-      res.status(400).json({ success: false, message: 'No file uploaded' });
-      return;
-    }
-
-    const { jobId } = req.body;
-    if (!jobId) {
-      fs.unlinkSync(req.file.path);
-      res.status(400).json({ success: false, message: 'jobId is required' });
-      return;
-    }
-
-    const job = await Job.findById(jobId);
-    if (!job) {
-      fs.unlinkSync(req.file.path);
-      res.status(404).json({ success: false, message: 'Job not found' });
-      return;
-    }
-
-    const fileType = getFileType(req.file.originalname);
-    let profiles: ParsedApplicant[] = [];
-
-    if (fileType === 'csv')       profiles = await parseCSV(req.file.path);
-    else if (fileType === 'xlsx') profiles = await parseXLSX(req.file.path);
-    else if (fileType === 'pdf')  profiles = [await parsePDF(req.file.path)];
-    else {
-      fs.unlinkSync(req.file.path);
-      res.status(400).json({ success: false, message: 'Unsupported file type' });
-      return;
-    }
-
-    fs.unlinkSync(req.file.path);
-
-    if (!profiles.length) {
-      res.status(400).json({ success: false, message: 'No valid records found in file' });
-      return;
-    }
-
-    const docs = profiles.map(profile => ({
-      jobId,
-      talentProfile: profile,
-      source: 'bulk_upload',
-    }));
-
-    const inserted = await Applicant.insertMany(docs, { ordered: false });
-    await Job.findByIdAndUpdate(jobId, { $inc: { applicantCount: inserted.length } });
-
-    res.status(201).json({
-      success: true,
-      message: `${inserted.length} applicant(s) uploaded successfully`,
-      count:   inserted.length,
-    });
-  } catch (err: any) {
-    console.error('❌ POST /applicants/bulk-upload error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to upload applicants' });
   }
 });
 
